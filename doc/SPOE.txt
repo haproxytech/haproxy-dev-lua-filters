@@ -525,12 +525,18 @@ event <name> [ { if | unless } <condition> ]
   Supported events are:
     - on-client-session
     - on-server-session
+    - on-start-request-analyze
+    - on-end-request-analyze
+    - on-start-response-analyze
+    - on-end-response-analyze
     - on-frontend-tcp-request
     - on-backend-tcp-request
     - on-tcp-response
     - on-frontend-http-request
     - on-backend-http-request
     - on-http-response
+    - on-end-http-request
+    - on-end-http-response
 
   See section "Events & Messages" for more details about supported events.
   See section 7 about ACL usage in the HAProxy Configuration Manual.
@@ -1073,6 +1079,9 @@ Here is the list of supported events:
                               This event is only available for SPOE filters
                               declared in a frontend or a listen section.
 
+  * on-start-request-analyze  is triggered when the analysis starts on the
+                              request channel.
+
   * on-frontend-tcp-request   is triggered just before the evaluation of
                               "tcp-request content" rules on the frontend side.
                               This event is only available for SPOE filters
@@ -1093,14 +1102,29 @@ Here is the list of supported events:
                               event is skipped for SPOE filters declared in a
                               listen section.
 
+  * on-end-http-request       is triggered when the end of the http request is
+                              reached.
+
+  * on-end-request-analyze    is triggered when the analysis ends on the
+                              request channel.
+
   * on-server-session         is triggered when the session with the server is
                               established.
+
+  * on-start-response-analyze is triggered when the analysis starts on the
+                              response channel.
 
   * on-tcp-response           is triggered just before the evaluation of
                               "tcp-response content" rules.
 
   * on-http-response          is triggered just before the evaluation of
                               "http-response" rules.
+
+  * on-end-http-response      is triggered when the end of the http response is
+                              reached.
+
+  * on-end-response-analyze   is triggered when the analysis ends on the
+                              response channel.
 
 
 The stream processing will loop on these events, when triggered, waiting the

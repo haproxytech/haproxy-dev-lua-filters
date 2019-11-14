@@ -206,15 +206,21 @@ static const char *spoe_frm_err_reasons[SPOE_FRM_ERRS] = {
 };
 
 static const char *spoe_event_str[SPOE_EV_EVENTS] = {
-	[SPOE_EV_ON_CLIENT_SESS] = "on-client-session",
-	[SPOE_EV_ON_TCP_REQ_FE]  = "on-frontend-tcp-request",
-	[SPOE_EV_ON_TCP_REQ_BE]  = "on-backend-tcp-request",
-	[SPOE_EV_ON_HTTP_REQ_FE] = "on-frontend-http-request",
-	[SPOE_EV_ON_HTTP_REQ_BE] = "on-backend-http-request",
+	[SPOE_EV_ON_CLIENT_SESS]   = "on-client-session",
+	[SPOE_EV_ON_START_REQ_ANA] = "on-start-request-analyze",
+	[SPOE_EV_ON_TCP_REQ_FE]    = "on-frontend-tcp-request",
+	[SPOE_EV_ON_TCP_REQ_BE]    = "on-backend-tcp-request",
+	[SPOE_EV_ON_HTTP_REQ_FE]   = "on-frontend-http-request",
+	[SPOE_EV_ON_HTTP_REQ_BE]   = "on-backend-http-request",
+	[SPOE_EV_ON_END_HTTP_REQ]  = "on-end-http-request",
+	[SPOE_EV_ON_END_REQ_ANA]   = "on-end-request-analyze",
 
-	[SPOE_EV_ON_SERVER_SESS] = "on-server-session",
-	[SPOE_EV_ON_TCP_RSP]     = "on-tcp-response",
-	[SPOE_EV_ON_HTTP_RSP]    = "on-http-response",
+	[SPOE_EV_ON_SERVER_SESS]   = "on-server-session",
+	[SPOE_EV_ON_START_RSP_ANA] = "on-start-response-analyze",
+	[SPOE_EV_ON_TCP_RSP]       = "on-tcp-response",
+	[SPOE_EV_ON_HTTP_RSP]      = "on-http-response",
+	[SPOE_EV_ON_END_HTTP_RSP]  = "on-end-http-response",
+	[SPOE_EV_ON_END_RSP_ANA]   = "on-end-response-analyze",
 };
 
 
@@ -2886,7 +2892,7 @@ spoe_create_context(struct stream *s, struct filter *filter)
 	ctx->buffer_wait.wakeup_cb = (int (*)(void *))spoe_wakeup_context;
 	LIST_INIT(&ctx->list);
 
-	ctx->stream_id   = 0;
+	ctx->stream_id   = s->uniq_id;
 	ctx->frame_id    = 1;
 	ctx->process_exp = TICK_ETERNITY;
 
@@ -3216,29 +3222,44 @@ spoe_start_analyze(struct stream *s, struct filter *filter, struct channel *chn)
 		if (filter->pre_analyzers & AN_REQ_INSPECT_BE)
 			chn->analysers |= AN_REQ_INSPECT_BE;
 
-		if (ctx->flags & SPOE_CTX_FL_CLI_CONNECTED)
-			goto out;
+		if (!(ctx->flags & SPOE_CTX_FL_SRV_CONNECTED) &&
+		    (!s->txn || !(s->txn->flags & TX_NOT_FIRST))) {
+			/* Execute 'on-client-session' event for the first session only */
+			ret = spoe_process_event(s, ctx, SPOE_EV_ON_CLIENT_SESS);
+			if (!ret)
+				goto out;
+		}
+		ctx->flags |= SPOE_CTX_FL_SRV_CONNECTED;
 
-		ctx->stream_id = s->uniq_id;
-		ret = spoe_process_event(s, ctx, SPOE_EV_ON_CLIENT_SESS);
+		/* Execute 'on-start-request-analyze' event */
+		ret = spoe_process_event(s, ctx, SPOE_EV_ON_START_REQ_ANA);
 		if (!ret)
 			goto out;
-		ctx->flags |= SPOE_CTX_FL_CLI_CONNECTED;
+
+		if (!LIST_ISEMPTY(&(ctx->events[SPOE_EV_ON_END_HTTP_REQ])))
+			register_data_filter(s, chn, filter);
 	}
 	else {
 		if (filter->pre_analyzers & AN_RES_INSPECT)
 			chn->analysers |= AN_RES_INSPECT;
 
-		if (ctx->flags & SPOE_CTX_FL_SRV_CONNECTED)
-			goto out;
-
-		ret = spoe_process_event(s, ctx, SPOE_EV_ON_SERVER_SESS);
-		if (!ret) {
-			channel_dont_read(chn);
-			channel_dont_close(chn);
-			goto out;
+		if (!(ctx->flags & SPOE_CTX_FL_SRV_CONNECTED)) {
+			ret = spoe_process_event(s, ctx, SPOE_EV_ON_SERVER_SESS);
+			if (!ret) {
+				channel_dont_read(chn);
+				channel_dont_close(chn);
+				goto out;
+			}
 		}
 		ctx->flags |= SPOE_CTX_FL_SRV_CONNECTED;
+
+		/* Execute 'on-start-response-analyze' event */
+		ret = spoe_process_event(s, ctx, SPOE_EV_ON_START_RSP_ANA);
+		if (!ret)
+			goto out;
+
+		if (!LIST_ISEMPTY(&(ctx->events[SPOE_EV_ON_END_HTTP_RSP])))
+			register_data_filter(s, chn, filter);
 	}
 
   out:
@@ -3292,11 +3313,12 @@ spoe_chn_pre_analyze(struct stream *s, struct filter *filter,
 	return ret;
 }
 
-/* Called when the filtering on the channel ends. */
+/* Called at the end of an HTTP message */
 static int
-spoe_end_analyze(struct stream *s, struct filter *filter, struct channel *chn)
+spoe_http_end(struct stream *s, struct filter *filter, struct http_msg *msg)
 {
 	struct spoe_context *ctx = filter->ctx;
+	int                  ret = 1;
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p - ctx-state=%s"
 		    " - ctx-flags=0x%08x\n",
@@ -3304,11 +3326,56 @@ spoe_end_analyze(struct stream *s, struct filter *filter, struct channel *chn)
 		    ((struct spoe_config *)FLT_CONF(filter))->agent->id,
 		    __FUNCTION__, s, spoe_ctx_state_str[ctx->state], ctx->flags);
 
-	if (!(ctx->flags & SPOE_CTX_FL_PROCESS)) {
-		spoe_reset_context(ctx);
+	if (!(msg->chn->flags & CF_ISRESP)) {
+		ret = spoe_process_event(s, ctx, SPOE_EV_ON_END_HTTP_REQ);
+		if (!ret)
+			goto out;
+	}
+	else {
+		ret = spoe_process_event(s, ctx, SPOE_EV_ON_END_HTTP_RSP);
+		if (!ret)
+			goto out;
 	}
 
-	return 1;
+  out:
+	return ret;
+}
+
+/* Called when the filtering on the channel ends. */
+static int
+spoe_end_analyze(struct stream *s, struct filter *filter, struct channel *chn)
+{
+	struct spoe_context *ctx = filter->ctx;
+	int                  ret = 1;
+
+	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p - ctx-state=%s"
+		    " - ctx-flags=0x%08x\n",
+		    (int)now.tv_sec, (int)now.tv_usec,
+		    ((struct spoe_config *)FLT_CONF(filter))->agent->id,
+		    __FUNCTION__, s, spoe_ctx_state_str[ctx->state], ctx->flags);
+
+	if (!(chn->flags & CF_ISRESP)) {
+		if (!(ctx->flags & SPOE_CTX_FL_REQ_END)) {
+			ret = spoe_process_event(s, ctx, SPOE_EV_ON_END_REQ_ANA);
+			if (!ret)
+				goto out;
+		}
+		ctx->flags |= SPOE_CTX_FL_REQ_END;
+	}
+	else {
+		if (!(ctx->flags & SPOE_CTX_FL_RSP_END)) {
+			ret = spoe_process_event(s, ctx, SPOE_EV_ON_END_RSP_ANA);
+			if (!ret)
+				goto out;
+		}
+		ctx->flags |= SPOE_CTX_FL_RSP_END;
+	}
+
+	if ((ctx->flags & (SPOE_CTX_FL_PROCESS|SPOE_CTX_FL_END)) == SPOE_CTX_FL_END)
+		spoe_reset_context(ctx);
+
+  out:
+	return ret;
 }
 
 /********************************************************************
@@ -3330,6 +3397,9 @@ struct flt_ops spoe_ops = {
 	.channel_start_analyze = spoe_start_analyze,
 	.channel_pre_analyze   = spoe_chn_pre_analyze,
 	.channel_end_analyze   = spoe_end_analyze,
+
+	/* HTTP callbacks */
+	.http_end = spoe_http_end,
 };
 
 
@@ -3998,6 +4068,8 @@ cfg_parse_spoe_message(const char *file, int linenum, char **args, int kwm)
 		}
 	}
 	else if (strcmp(args[0], "event") == 0) {
+		int i;
+
 		if (!*args[1]) {
 			ha_alert("parsing [%s:%d] : missing event name.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -4006,25 +4078,14 @@ cfg_parse_spoe_message(const char *file, int linenum, char **args, int kwm)
 		/* if (alertif_too_many_args(1, file, linenum, args, &err_code)) */
 		/* 	goto out; */
 
-		if (strcmp(args[1], spoe_event_str[SPOE_EV_ON_CLIENT_SESS]) == 0)
-			curmsg->event = SPOE_EV_ON_CLIENT_SESS;
-		else if (strcmp(args[1], spoe_event_str[SPOE_EV_ON_SERVER_SESS]) == 0)
-			curmsg->event = SPOE_EV_ON_SERVER_SESS;
 
-		else if (strcmp(args[1], spoe_event_str[SPOE_EV_ON_TCP_REQ_FE]) == 0)
-			curmsg->event = SPOE_EV_ON_TCP_REQ_FE;
-		else if (strcmp(args[1], spoe_event_str[SPOE_EV_ON_TCP_REQ_BE]) == 0)
-			curmsg->event = SPOE_EV_ON_TCP_REQ_BE;
-		else if (strcmp(args[1], spoe_event_str[SPOE_EV_ON_TCP_RSP]) == 0)
-			curmsg->event = SPOE_EV_ON_TCP_RSP;
-
-		else if (strcmp(args[1], spoe_event_str[SPOE_EV_ON_HTTP_REQ_FE]) == 0)
-			curmsg->event = SPOE_EV_ON_HTTP_REQ_FE;
-		else if (strcmp(args[1], spoe_event_str[SPOE_EV_ON_HTTP_REQ_BE]) == 0)
-			curmsg->event = SPOE_EV_ON_HTTP_REQ_BE;
-		else if (strcmp(args[1], spoe_event_str[SPOE_EV_ON_HTTP_RSP]) == 0)
-			curmsg->event = SPOE_EV_ON_HTTP_RSP;
-		else {
+		for (i = 0; i < SPOE_EV_EVENTS; i++) {
+			if (spoe_event_str[i] && !strcmp(args[1], spoe_event_str[i])) {
+				curmsg->event = i;
+				break;
+			}
+		}
+		if (curmsg->event == SPOE_EV_NONE) {
 			ha_alert("parsing [%s:%d] : unknown event '%s'.\n",
 				 file, linenum, args[1]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -4278,6 +4339,13 @@ parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 						where |= SMP_VAL_FE_CON_ACC;
 						break;
 
+					case SPOE_EV_ON_START_REQ_ANA:
+						if (px->cap & PR_CAP_FE)
+							where |= SMP_VAL_FE_CON_ACC;
+						if (px->cap & PR_CAP_BE)
+							where |= SMP_VAL_BE_SRV_CON;
+						break;
+
 					case SPOE_EV_ON_TCP_REQ_FE:
 						where |= SMP_VAL_FE_REQ_CNT;
 						break;
@@ -4300,7 +4368,19 @@ parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 							where |= SMP_VAL_BE_HRQ_HDR;
 						break;
 
+					case SPOE_EV_ON_END_HTTP_REQ:
+						where |= SMP_VAL_FE_LOG_END;
+						break;
+
+					case SPOE_EV_ON_END_REQ_ANA:
+						where |= SMP_VAL_FE_LOG_END;
+						break;
+
 					case SPOE_EV_ON_SERVER_SESS:
+						where |= SMP_VAL_BE_SRV_CON;
+						break;
+
+					case SPOE_EV_ON_START_RSP_ANA:
 						where |= SMP_VAL_BE_SRV_CON;
 						break;
 
@@ -4316,6 +4396,14 @@ parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 							where |= SMP_VAL_FE_HRS_HDR;
 						if (px->cap & PR_CAP_BE)
 							where |= SMP_VAL_BE_HRS_HDR;
+						break;
+
+					case SPOE_EV_ON_END_HTTP_RSP:
+						where |= SMP_VAL_FE_LOG_END;
+						break;
+
+					case SPOE_EV_ON_END_RSP_ANA:
+						where |= SMP_VAL_FE_LOG_END;
 						break;
 
 					default:
