@@ -52,8 +52,11 @@
 #define SPOE_CTX_FL_REQ_PROCESS   0x00000004 /* Set when SPOE is processing the request */
 #define SPOE_CTX_FL_RSP_PROCESS   0x00000008 /* Set when SPOE is processing the response */
 #define SPOE_CTX_FL_FRAGMENTED    0x00000010 /* Set when a fragmented frame is processing */
+#define SPOE_CTX_FL_REQ_END       0x00000020 /* Set when the SPOE has finished to evaluate the request */
+#define SPOE_CTX_FL_RSP_END       0x00000040 /* Set when the SPOE has finished to evaluate the response */
 
 #define SPOE_CTX_FL_PROCESS (SPOE_CTX_FL_REQ_PROCESS|SPOE_CTX_FL_RSP_PROCESS)
+#define SPOE_CTX_FL_END     (SPOE_CTX_FL_REQ_END|SPOE_CTX_FL_RSP_END)
 
 /* Flags set on the SPOE applet */
 #define SPOE_APPCTX_FL_PIPELINING    0x00000001 /* Set if pipelining is supported */
@@ -113,15 +116,21 @@ enum spoe_event {
 
 	/* Request events */
 	SPOE_EV_ON_CLIENT_SESS = 1,
+	SPOE_EV_ON_START_REQ_ANA,
 	SPOE_EV_ON_TCP_REQ_FE,
 	SPOE_EV_ON_TCP_REQ_BE,
 	SPOE_EV_ON_HTTP_REQ_FE,
 	SPOE_EV_ON_HTTP_REQ_BE,
+	SPOE_EV_ON_END_HTTP_REQ,
+	SPOE_EV_ON_END_REQ_ANA,
 
 	/* Response events */
 	SPOE_EV_ON_SERVER_SESS,
+	SPOE_EV_ON_START_RSP_ANA,
 	SPOE_EV_ON_TCP_RSP,
 	SPOE_EV_ON_HTTP_RSP,
+	SPOE_EV_ON_END_HTTP_RSP,
+	SPOE_EV_ON_END_RSP_ANA,
 
 	SPOE_EV_EVENTS
 };
