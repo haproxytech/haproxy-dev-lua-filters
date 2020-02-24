@@ -606,6 +606,9 @@ static void stream_free(struct stream *s)
 	pool_free(pool_head_uniqueid, s->unique_id.ptr);
 	s->unique_id = IST_NULL;
 
+	flt_stream_stop(s);
+	flt_stream_release(s, 0);
+
 	hlua_ctx_destroy(s->hlua);
 	s->hlua = NULL;
 	if (s->txn)
@@ -639,9 +642,6 @@ static void stream_free(struct stream *s)
 		pool_free(dns_requester_pool, s->dns_ctx.dns_requester);
 		s->dns_ctx.dns_requester = NULL;
 	}
-
-	flt_stream_stop(s);
-	flt_stream_release(s, 0);
 
 	if (fe) {
 		if (s->req_cap) {
