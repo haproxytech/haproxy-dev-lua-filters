@@ -3004,6 +3004,33 @@ static int hlua_channel_new(lua_State *L, struct channel *channel)
 	return 1;
 }
 
+/* Helper function returning a filter attached to a channel at the position <ud>
+ * in the stack, filling the current offset and length of the filter. If no
+ * filter is attached, NULL is returned and <offet> and <len> are filled with
+ * output and input length respectively.
+ */
+static __maybe_unused struct filter *hlua_channel_filter(lua_State *L, int ud, struct channel *chn, size_t *offset, size_t *len)
+{
+	struct filter *filter = NULL;
+
+	*offset = co_data(chn);
+	*len    = ci_data(chn);
+
+	if (lua_getfield(L, ud, "__filter") == LUA_TLIGHTUSERDATA) {
+		struct hlua_flt_ctx *flt_ctx;
+
+		filter  = lua_touserdata (L, -1);
+		flt_ctx = filter->ctx;
+		if (hlua_filter_from_payload(filter)) {
+			*offset  = flt_ctx->cur_off[CHN_IDX(chn)];
+			*len     = flt_ctx->cur_len[CHN_IDX(chn)];
+		}
+	}
+
+	lua_pop(L, 1);
+	return filter;
+}
+
 /* Copies <len> bytes of data present in the channel's buffer, starting at the
  * offset <offset>, and put it in a LUA string variable. It is the caller
  * responsibility to ensure <len> and <offset> are valid. If some data are
