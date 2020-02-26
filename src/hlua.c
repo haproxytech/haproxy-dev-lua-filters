@@ -221,6 +221,8 @@ struct hlua_flt_ctx {
 
 DECLARE_STATIC_POOL(pool_head_hlua_flt_ctx, "hlua_flt_ctx", sizeof(struct hlua_flt_ctx));
 
+static int hlua_filter_from_payload(struct filter *filter);
+
 /* This is the chained list of struct hlua_flt referenced
  * for haproxy filters. It is used for a post-initialisation control.
  */
@@ -3009,7 +3011,7 @@ static int hlua_channel_new(lua_State *L, struct channel *channel)
  * filter is attached, NULL is returned and <offet> and <len> are filled with
  * output and input length respectively.
  */
-static __maybe_unused struct filter *hlua_channel_filter(lua_State *L, int ud, struct channel *chn, size_t *offset, size_t *len)
+static struct filter *hlua_channel_filter(lua_State *L, int ud, struct channel *chn, size_t *offset, size_t *len)
 {
 	struct filter *filter = NULL;
 
@@ -3140,12 +3142,18 @@ static void _hlua_channel_erase_data(struct channel *chn, size_t offset, size_t 
 	b_sub(&chn->buf, len);
 }
 
-/* "_hlua_channel_dup" wrapper. If no data are available, it returns
- * a yield. This function keep the data in the buffer.
+/* Duplicates data from the channel's buffer. It may be called from an action or
+ * a filter. It mainly relies on _hlua_channel_dup(). If called from an action,
+ * it may yield if no data was copied. From a filter, the function immediately
+ * returns. If nothing was copied, a nil value is pushed on the stack.
+ *
+ *  From an action, All input data are considered. For a filter, the offset and
+ *  the length of input data to consider are retrieved from the filter context.
  */
 __LJMP static int hlua_channel_dup_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	struct channel *chn;
+	struct filter *filter = NULL;
 	size_t offset, len;
 	int ret;
 
@@ -3156,12 +3164,18 @@ __LJMP static int hlua_channel_dup_yield(lua_State *L, int status, lua_KContext 
 		WILL_LJMP(lua_error(L));
 	}
 
-	offset = co_data(chn);
-	len = ci_data(chn);
+	filter = hlua_channel_filter(L, 1, chn, &offset, &len);
+	if (filter && !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
 
 	ret = _hlua_channel_dup(chn, L, offset, len);
+
 	if (ret == 0) {
-		/* Yield only if nothing was duplicated */
+		/* Yield only if nothing was duplicated and we are not inside a filter */
+		if (filter) {
+			lua_pushnil(L);
+			return 1;
+		}
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_channel_dup_yield, TICK_ETERNITY, 0));
 	}
 	return 1;
@@ -3175,14 +3189,19 @@ __LJMP static int hlua_channel_dup(lua_State *L)
 	return MAY_LJMP(hlua_channel_dup_yield(L, 0, 0));
 }
 
-/* "_hlua_channel_dup" wrapper. If no data are available, it returns
- * a yield. This function consumes the data in the buffer. It returns
- * a string containing the data or a nil pointer if no data are available
- * and the channel is closed.
+/* Consumes data from the channel's buffer. This means it duplicates data and
+ * removes them from the channel's buffer. It may be called from an action or a
+ * filter. If called from an action, it may yield if no data was copied. From a
+ * filter, the function immediately returns. If nothing was copied, a nil value
+ * is pushed on the stack.
+ *
+ *  From an action, All input data are considered. For a filter, the offset and
+ *  the length of input data to consider are retrieved from the filter context.
  */
 __LJMP static int hlua_channel_get_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	struct channel *chn;
+	struct filter *filter = NULL;
 	size_t offset, len;
 	int ret;
 
@@ -3193,18 +3212,30 @@ __LJMP static int hlua_channel_get_yield(lua_State *L, int status, lua_KContext 
 		WILL_LJMP(lua_error(L));
 	}
 
-	offset = co_data(chn);
-	len = ci_data(chn);
+	filter = hlua_channel_filter(L, 1, chn, &offset, &len);
+	if (filter && !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
 
 	ret = _hlua_channel_dup(chn, L, offset, len);
+
 	if (ret == 0) {
-		/* Yield only if nothing was duplicated */
+		/* Yield only if nothing was duplicated and we are not inside a filter */
+		if (filter) {
+			lua_pushnil(L);
+			return 1;
+		}
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_channel_get_yield, TICK_ETERNITY, 0));
 	}
 	if (unlikely(ret == -1))
 		return 1;
 
 	_hlua_channel_erase_data(chn, offset, ret);
+	if (filter) {
+		struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+		flt_update_offsets(filter, chn, -ret);
+		flt_ctx->cur_len[CHN_IDX(chn)] -= ret;
+	}
 	return 1;
 }
 
@@ -3216,14 +3247,19 @@ __LJMP static int hlua_channel_get(lua_State *L)
 	return MAY_LJMP(hlua_channel_get_yield(L, 0, 0));
 }
 
-/* This functions consumes and returns one line. If the channel is closed,
- * and the last data does not contains a final '\n', the data are returned
- * without the final '\n'. When no more data are available, it returns nil
- * value.
+/* Consumes one line from the channel's buffer. It may be called from an action
+ * or a filter. If called from an action, it may yeild if no LF is found and if
+ * the channel's input is not closed. Otherwise all data are consumes. From a
+ * filter, the function immediately returns. If nothing was copied, a nil value
+ * is pushed on the stack.
+ *
+ *  From an action, All input data are considered. For a filter, the offset and
+ *  the length of input data to consider are retrieved from the filter context.
  */
 __LJMP static int hlua_channel_getline_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	struct channel *chn;
+	struct filter *filter = NULL;
 	size_t offset, len;
 	int ret;
 
@@ -3234,18 +3270,30 @@ __LJMP static int hlua_channel_getline_yield(lua_State *L, int status, lua_KCont
 		WILL_LJMP(lua_error(L));
 	}
 
-	offset = co_data(chn);
-	len = ci_data(chn);
+	filter = hlua_channel_filter(L, 1, chn, &offset, &len);
+	if (filter && !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
 
 	ret = _hlua_channel_dupline(chn, L, offset, len);
+
 	if (ret == 0) {
-		/* Yield only if nothing was duplicated */
+		/* Yield only if nothing was duplicated and we are not inside a filter */
+		if (filter) {
+			lua_pushnil(L);
+			return 1;
+		}
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_channel_getline_yield, TICK_ETERNITY, 0));
 	}
 	if (unlikely(ret == -1))
 		return 1;
 
 	_hlua_channel_erase_data(chn, offset, ret);
+	if (filter) {
+		struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+		flt_update_offsets(filter, chn, -ret);
+		flt_ctx->cur_len[CHN_IDX(chn)] -= ret;
+	}
 	return 1;
 }
 
@@ -3257,16 +3305,21 @@ __LJMP static int hlua_channel_getline(lua_State *L)
 	return MAY_LJMP(hlua_channel_getline_yield(L, 0, 0));
 }
 
-/* This function takes a string as input, and append it at the
- * input side of channel. If the data is too big, but a space
- * is probably available after sending some data, the function
- * yields. If the data is bigger than the buffer, or if the
- * channel is closed, it returns -1. Otherwise, it returns the
- * amount of data written.
+
+/* Appends as must data as possible from a string into the channel's input part
+ * of the buffer. It may be called from an action or a filter. It mainly relies
+ * on _hlua_channel_append(). If called from an action, it may yield if the
+ * string is too big but some data are scheduled for output. From a filter, the
+ * function immediately returns. If nothing was copied and the channel's input
+ * is closed, it returns -1. Otherwise, it returns the number of bytes appended.
+ *
+ *  From an action, the string is appended after input data. For a filter, the
+ *  string is appended at the offset <offset+len>.
  */
 __LJMP static int hlua_channel_append_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	struct channel *chn = MAY_LJMP(hlua_checkchannel(L, 1));
+	struct filter *filter = NULL;
 	const char *str;
 	size_t offset, len, sz;
 	int l, ret;
@@ -3278,8 +3331,9 @@ __LJMP static int hlua_channel_append_yield(lua_State *L, int status, lua_KConte
 
 	str = MAY_LJMP(luaL_checklstring(L, 2, &sz));
 	l = MAY_LJMP(luaL_checkinteger(L, 3));
-	offset = co_data(chn);
-	len = ci_data(chn);
+	filter = hlua_channel_filter(L, 1, chn, &offset, &len);
+	if (filter && !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
 
 	ret = _hlua_channel_append(chn, L, ist2(str+l, sz - l), offset+len);
 	if (ret == -1) {
@@ -3288,6 +3342,14 @@ __LJMP static int hlua_channel_append_yield(lua_State *L, int status, lua_KConte
 		return 1;
 	}
 	if (ret) {
+		/* Update filter's data */
+		if (filter) {
+			struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+			flt_update_offsets(filter, chn, ret);
+			flt_ctx->cur_len[CHN_IDX(chn)] += ret;
+		}
+
 		/* Update the amount of data copied */
 		l += ret;
 		lua_pop(L, 1);
@@ -3296,9 +3358,10 @@ __LJMP static int hlua_channel_append_yield(lua_State *L, int status, lua_KConte
 
 	/* Some data still to be copied */
 	if (l < sz) {
-		/* Yield only if the channel's output is not empty.
-		 * Otherwise it means we cannot add more data. */
-		if (!co_data(chn))
+		/* Yield only if we are not inside a filter and if the channel's
+		 * output is not empty.  Otherwise it means we cannot add more
+		 * data. */
+		if (filter || !co_data(chn))
 			return 1;
 		chn->flags |= CF_WAKE_WRITE;
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_channel_append_yield, TICK_ETERNITY, 0));
@@ -3307,10 +3370,8 @@ __LJMP static int hlua_channel_append_yield(lua_State *L, int status, lua_KConte
 	return 1;
 }
 
-/* Just a wrapper of "hlua_channel_append_yield". It returns the length
- * of the written string, or -1 if the channel is closed or if the
- * buffer size is too little for the data.
- */
+/* Check arguments and prepare the stack for the function
+ * "hlua_channel_append_yield". */
 __LJMP static int hlua_channel_append(lua_State *L)
 {
 	size_t len;
@@ -3323,15 +3384,18 @@ __LJMP static int hlua_channel_append(lua_State *L)
 	return MAY_LJMP(hlua_channel_append_yield(L, 0, 0));
 }
 
-/* Just a wrapper of "hlua_channel_append_yield". This wrapper starts
- * his process by cleaning the buffer. The result is a replacement
- * of the current data. It returns the length of the written string,
- * or -1 if the channel is closed or if the buffer size is too
- * little for the data.
+/* Remove input data from a buffer's channel and appends as much data as
+ * possible from a string into the channel's input part of the buffer. It may be
+ * called from an action or a filter. It relies on hlua_channel_append_yield()
+ * to append data.
+ *
+ *  From an action, All input data are considered. For a filter, the offset and
+ *  the length of input data to consider are retrieved from the filter context.
  */
 __LJMP static int hlua_channel_set(lua_State *L)
 {
 	struct channel *chn;
+	struct filter *filter = NULL;
 	size_t offset, len;
 
 	MAY_LJMP(check_args(L, 2, "set"));
@@ -3342,25 +3406,40 @@ __LJMP static int hlua_channel_set(lua_State *L)
 		WILL_LJMP(lua_error(L));
 	}
 
-	offset = co_data(chn);
-	len = ci_data(chn);
+	filter = hlua_channel_filter(L, 1, chn, &offset, &len);
+	if (filter && !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
 
 	_hlua_channel_erase_data(chn, offset, len);
+	if (filter) {
+		struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+		flt_update_offsets(filter, chn, -len);
+		flt_ctx->cur_len[CHN_IDX(chn)] -= len;
+	}
 
 	lua_pushinteger(L, 0);
 	return MAY_LJMP(hlua_channel_append_yield(L, 0, 0));
 }
 
-/* Append data in the output side of the buffer. This data is immediately
- * sent. The function returns the amount of data written. If the buffer
- * cannot contain the data, the function yields. The function returns -1
- * if the channel is closed.
+/* Prepends as must data as possible from a string into the channel's input part
+ * of the buffer and schedule them for output. It may be called from an action
+ * or a filter. It mainly relies on _hlua_channel_append(). If called from an
+ * action, it may yield if the string is too big but some data are scheduled for
+ * output. From a filter, the function immediately returns. If nothing was
+ * copied and the channel's input is closed, it returns -1. It also returns -1
+ * if the channel's output is closed. Otherwise, it returns the number of bytes
+ * sent.
+ *
+ *  From an action, the string is appended before input data. For a filter, the
+ *  string is appended at the offset <offset>.
  */
 __LJMP static int hlua_channel_send_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	struct channel *chn = MAY_LJMP(hlua_checkchannel(L, 1));
+	struct filter *filter = NULL;
 	const char *str;
-	size_t offset, sz;
+	size_t offset, len, sz;
 	int l ,ret;
 
 	if (IS_HTX_STRM(chn_strm(chn))) {
@@ -3370,7 +3449,9 @@ __LJMP static int hlua_channel_send_yield(lua_State *L, int status, lua_KContext
 
 	str = MAY_LJMP(luaL_checklstring(L, 2, &sz));
 	l = MAY_LJMP(luaL_checkinteger(L, 3));
-	offset = co_data(chn);
+	filter = hlua_channel_filter(L, 1, chn, &offset, &len);
+	if (filter && !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
 
 	/* Return an error if the channel's output is closed */
 	if (unlikely(channel_output_closed(chn))) {
@@ -3385,7 +3466,15 @@ __LJMP static int hlua_channel_send_yield(lua_State *L, int status, lua_KContext
 		return 1;
 	}
 	if (ret) {
-		c_adv(chn, ret);
+		if (!filter)
+			c_adv(chn, ret);
+		else {
+			struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+			FLT_OFF(filter, chn) += ret;
+			flt_update_offsets(filter, chn, ret);
+			flt_ctx->cur_off[CHN_IDX(chn)] += ret;
+		}
 
 		l += ret;
 		lua_pop(L, 1);
@@ -3402,9 +3491,10 @@ __LJMP static int hlua_channel_send_yield(lua_State *L, int status, lua_KContext
 			return 1;
 		}
 
-		/* Yield only if the channel's output is not empty.
-		 * Otherwise it means we cannot add more data. */
-		if (!co_data(chn))
+		/* Yield only if we are not inside a filter and if the channel's
+		 * output is not empty.  Otherwise it means we cannot add more
+		 * data. */
+		if (filter || !co_data(chn))
 			return 1;
 
 		/* If we are waiting for space in the response buffer, we
@@ -3421,9 +3511,8 @@ __LJMP static int hlua_channel_send_yield(lua_State *L, int status, lua_KContext
 	return 1;
 }
 
-/* Just a wrapper of "_hlua_channel_send". This wrapper permits
- * yield the LUA process, and resume it without checking the
- * input arguments.
+/* Check arguments and prepare the stack for the function
+ * "hlua_channel_send_yield".
  */
 __LJMP static int hlua_channel_send(lua_State *L)
 {
@@ -3437,17 +3526,21 @@ __LJMP static int hlua_channel_send(lua_State *L)
 	return MAY_LJMP(hlua_channel_send_yield(L, 0, 0));
 }
 
-/* This function forward and amount of butes. The data pass from
- * the input side of the buffer to the output side, and can be
- * forwarded. This function never fails.
+/* Forwards a given amount of bytes. It may be called from an action or a
+ * filter. If called from an action, it may yield if more data must still be
+ * forwarded and if the channel's input is not closed. From a filter, the
+ * function returns immediately. It return -1 if the channel's output is
+ * closed. Otherwise, it returns the number of bytes forwarded.
  *
- * The Lua function takes an amount of bytes to be forwarded in
- * input. It returns the number of bytes forwarded.
+ * From an action, all input data are considered. For a filter, only data
+ * between <offset> and <len> are considered, and the data are just scheduled
+ * for ouput from the filter's point of view.
  */
 __LJMP static int hlua_channel_forward_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	struct channel *chn = MAY_LJMP(hlua_checkchannel(L, 1));
-	size_t len;
+	struct filter *filter = NULL;
+	size_t offset, len;
 	int fwd, l, max;
 
 	if (IS_HTX_STRM(chn_strm(chn))) {
@@ -3457,7 +3550,9 @@ __LJMP static int hlua_channel_forward_yield(lua_State *L, int status, lua_KCont
 
 	fwd = MAY_LJMP(luaL_checkinteger(L, 2));
 	l = MAY_LJMP(luaL_checkinteger(L, -1));
-	len = ci_data(chn);
+	filter = hlua_channel_filter(L, 1, chn, &offset, &len);
+	if (filter && !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
 
 	/* Nothing to do, just return (the copied length is already on the stack) */
 	if (!fwd)
@@ -3473,7 +3568,15 @@ __LJMP static int hlua_channel_forward_yield(lua_State *L, int status, lua_KCont
 	if (max > len)
 		max = len;
 
-	channel_forward(chn, max);
+	if (!filter)
+		channel_forward(chn, max);
+	else {
+		struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+		FLT_OFF(filter, chn) += max;
+		flt_ctx->cur_off[CHN_IDX(chn)] += max;
+		flt_ctx->cur_len[CHN_IDX(chn)] -= max;
+	}
 
 	l += max;
 	lua_pop(L, 1);
@@ -3490,10 +3593,11 @@ __LJMP static int hlua_channel_forward_yield(lua_State *L, int status, lua_KCont
 			return 1;
 		}
 
-		/* The channel's input or the channel's output are closed,
-		 * we must return the amount of data forwarded.
+		/* The the channel's input or the channel's output are closed,
+		 * we must return the amount of data forwarded. We do so also if
+		 * we are inside a filter.
 		 */
-		if (channel_input_closed(chn))
+		if (filter || channel_input_closed(chn))
 			return 1;
 
 		/* If we are waiting for space data in the response buffer, we
@@ -3512,8 +3616,8 @@ __LJMP static int hlua_channel_forward_yield(lua_State *L, int status, lua_KCont
 	return 1;
 }
 
-/* Just check the input and prepare the stack for the previous
- * function "hlua_channel_forward_yield"
+/* check arguments and prepare the stack for the function
+ * "hlua_channel_forward_yield".
  */
 __LJMP static int hlua_channel_forward(lua_State *L)
 {
@@ -8648,6 +8752,13 @@ static void hlua_filter_delete(struct stream *s, struct filter *filter)
 	hlua_ctx_destroy(flt_ctx->hlua[1]);
 	pool_free(pool_head_hlua_flt_ctx, flt_ctx);
 	filter->ctx = NULL;
+}
+
+static int hlua_filter_from_payload(struct filter *filter)
+{
+	struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+	return (flt_ctx && !!(flt_ctx->flags & HLUA_FLT_CTX_FL_PAYLOAD));
 }
 
 static int hlua_filter_parse_fct(char **args, int *cur_arg, struct proxy *px,
