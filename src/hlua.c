@@ -259,6 +259,7 @@ static int class_channel_ref;
 static int class_fetches_ref;
 static int class_converters_ref;
 static int class_http_ref;
+static int class_http_msg_ref;
 static int class_map_ref;
 static int class_applet_tcp_ref;
 static int class_applet_http_ref;
@@ -5242,6 +5243,39 @@ static int hlua_http_new(lua_State *L, struct hlua_txn *txn)
 	return 1;
 }
 
+/* This function creates and returns an array containing the status-line
+ * elements. This function does not fails.
+ */
+__LJMP static int hlua_http_get_stline(lua_State *L, struct htx_sl *sl)
+{
+	/* Create the table. */
+	lua_newtable(L);
+
+	if (sl->flags & HTX_SL_F_IS_RESP) {
+		lua_pushstring(L, "version");
+		lua_pushlstring(L, HTX_SL_RES_VPTR(sl), HTX_SL_RES_VLEN(sl));
+		lua_settable(L, -3);
+		lua_pushstring(L, "code");
+		lua_pushlstring(L, HTX_SL_RES_CPTR(sl), HTX_SL_RES_CLEN(sl));
+		lua_settable(L, -3);
+		lua_pushstring(L, "reason");
+		lua_pushlstring(L, HTX_SL_RES_RPTR(sl), HTX_SL_RES_RLEN(sl));
+		lua_settable(L, -3);
+	}
+	else {
+		lua_pushstring(L, "method");
+		lua_pushlstring(L, HTX_SL_REQ_MPTR(sl), HTX_SL_REQ_MLEN(sl));
+		lua_settable(L, -3);
+		lua_pushstring(L, "uri");
+		lua_pushlstring(L, HTX_SL_REQ_UPTR(sl), HTX_SL_REQ_ULEN(sl));
+		lua_settable(L, -3);
+		lua_pushstring(L, "version");
+		lua_pushlstring(L, HTX_SL_REQ_VPTR(sl), HTX_SL_REQ_VLEN(sl));
+		lua_settable(L, -3);
+	}
+	return 1;
+}
+
 /* This function creates ans returns an array of HTTP headers.
  * This function does not fails. It is used as wrapper with the
  * 2 following functions.
@@ -5601,6 +5635,785 @@ static int hlua_http_res_set_status(lua_State *L)
 
 	http_res_set_status(code, reason, htxn->s);
 	return 0;
+}
+
+/*
+ *
+ *
+ * Class HTTPMessage
+ *
+ *
+ */
+
+/* Returns a struct http_msg if the stack entry "ud" is a class HTTPMessage,
+ * otherwise it throws an error.
+ */
+__LJMP static struct http_msg *hlua_checkhttpmsg(lua_State *L, int ud)
+{
+	return MAY_LJMP(hlua_checkudata(L, ud, class_http_msg_ref));
+}
+
+/* Creates and pushes on the stack a HTTP object according with a current TXN.
+ */
+static __maybe_unused int hlua_http_msg_new(lua_State *L, struct http_msg *msg)
+{
+	/* Check stack size. */
+	if (!lua_checkstack(L, 3))
+		return 0;
+
+	lua_newtable(L);
+	lua_pushlightuserdata(L, msg);
+	lua_rawseti(L, -2, 0);
+
+	/* Pop a class stream metatable and affect it to the table. */
+	lua_rawgeti(L, LUA_REGISTRYINDEX, class_http_msg_ref);
+	lua_setmetatable(L, -2);
+
+	return 1;
+}
+
+/* Helper function returning a filter attached to the HTTP message at the
+ * position <ud> in the stack, filling the current offset and length of the
+ * filter. If no filter is attached, NULL is returned and <offet> and <len> are
+ * filled with output and input length respectively.
+ */
+static struct filter *hlua_http_msg_filter(lua_State *L, int ud, struct http_msg *msg, size_t *offset, size_t *len)
+{
+	struct channel *chn = msg->chn;
+	struct htx *htx = htxbuf(&chn->buf);
+	struct filter *filter = NULL;
+
+	*offset = co_data(msg->chn);
+	*len    = htx->data - co_data(msg->chn);
+
+	if (lua_getfield(L, ud, "__filter") == LUA_TLIGHTUSERDATA) {
+		filter  = lua_touserdata (L, -1);
+		if (msg->msg_state >= HTTP_MSG_DATA) {
+			struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+			*offset  = flt_ctx->cur_off[CHN_IDX(chn)];
+			*len     = flt_ctx->cur_len[CHN_IDX(chn)];
+		}
+	}
+
+	lua_pop(L, 1);
+	return filter;
+}
+
+/* Returns true if the channel attached to the HTTP message is the response
+ * channel.
+ */
+__LJMP static int hlua_http_msg_is_resp(lua_State *L)
+{
+	struct http_msg *msg;
+
+	MAY_LJMP(check_args(L, 1, "is_resp"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	lua_pushboolean(L, !!(msg->chn->flags & CF_ISRESP));
+	return 1;
+}
+
+/* Returns an array containing the elements status-line of the HTTP message. It relies
+ * on hlua_http_get_stline().
+ */
+__LJMP static int hlua_http_msg_get_stline(lua_State *L)
+{
+	struct http_msg *msg;
+	struct htx *htx;
+	struct htx_sl *sl;
+
+	MAY_LJMP(check_args(L, 1, "get_stline"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	htx = htxbuf(&msg->chn->buf);
+	sl = http_get_stline(htx);
+	if (!sl)
+		return 0;
+	return hlua_http_get_stline(L, sl);
+}
+
+/* Returns an array containing all headers of the HTTP message. it relies on
+ * hlua_http_get_headers().
+ */
+__LJMP static int hlua_http_msg_get_headers(lua_State *L)
+{
+	struct http_msg *msg;
+
+	MAY_LJMP(check_args(L, 1, "get_headers"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	return hlua_http_get_headers(L, msg);
+}
+
+/* Deletes all occurrences of an header in the HTTP message matching on its
+ * name. It relies on hlua_http_del_hdr().
+ */
+__LJMP static int hlua_http_msg_del_hdr(lua_State *L)
+{
+	struct http_msg *msg;
+
+	MAY_LJMP(check_args(L, 2, "del_header"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	return hlua_http_del_hdr(L, msg);
+}
+
+/* Matches the full value line of all occurences of an header in the HTTP
+ * message given its name against a regex and replaces it if it matches. It
+ * relies on hlua_http_rep_hdr().
+ */
+__LJMP static int hlua_http_msg_rep_hdr(lua_State *L)
+{
+	struct http_msg *msg;
+
+	MAY_LJMP(check_args(L, 4, "rep_header"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	return hlua_http_rep_hdr(L, msg, 1);
+}
+
+/* Matches all comma-separated values of all occurences of an header in the HTTP
+ * message given its name against a regex and replaces it if it matches. It
+ * relies on hlua_http_rep_hdr().
+ */
+__LJMP static int hlua_http_msg_rep_val(lua_State *L)
+{
+	struct http_msg *msg;
+
+	MAY_LJMP(check_args(L, 4, "rep_value"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	return hlua_http_rep_hdr(L, msg, 0);
+}
+
+/* Add an header in the HTTP message. It relies on hlua_http_add_hdr() */
+__LJMP static int hlua_http_msg_add_hdr(lua_State *L)
+{
+	struct http_msg *msg;
+
+	MAY_LJMP(check_args(L, 3, "add_header"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	return hlua_http_add_hdr(L, msg);
+}
+
+/* Add an header in the HTTP message removing existing headers with the same
+ * name. It relies on hlua_http_del_hdr() and hlua_http_add_hdr().
+ */
+__LJMP static int hlua_http_msg_set_hdr(lua_State *L)
+{
+	struct http_msg *msg;
+
+	MAY_LJMP(check_args(L, 3, "set_header"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	hlua_http_del_hdr(L, msg);
+	return hlua_http_add_hdr(L, msg);
+}
+
+/* Rewrites the request method. It relies on http_req_replace_stline(). */
+__LJMP static int hlua_http_msg_set_meth(lua_State *L)
+{
+	struct stream *s;
+	struct http_msg *msg;
+	const char *name;
+	size_t name_len;
+
+	MAY_LJMP(check_args(L, 2, "set_method"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	name = MAY_LJMP(luaL_checklstring(L, 2, &name_len));
+
+	if ((msg->chn->flags & CF_ISRESP) || msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	s = chn_strm(msg->chn);
+	lua_pushboolean(L, http_req_replace_stline(0, name, name_len, s->be, s) != -1);
+	return 1;
+}
+
+/* Rewrites the request path. It relies on http_req_replace_stline(). */
+__LJMP static int hlua_http_msg_set_path(lua_State *L)
+{
+	struct stream *s;
+	struct http_msg *msg;
+	const char *name;
+	size_t name_len;
+
+	MAY_LJMP(check_args(L, 2, "set_path"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	name = MAY_LJMP(luaL_checklstring(L, 2, &name_len));
+
+	if ((msg->chn->flags & CF_ISRESP) || msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	s = chn_strm(msg->chn);
+	lua_pushboolean(L, http_req_replace_stline(1, name, name_len, s->be, s) != -1);
+	return 1;
+}
+
+/* Rewrites the request query-string. It relies on http_req_replace_stline(). */
+__LJMP static int hlua_http_msg_set_query(lua_State *L)
+{
+	struct stream *s;
+	struct http_msg *msg;
+	const char *name;
+	size_t name_len;
+
+	MAY_LJMP(check_args(L, 2, "set_query"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	name = MAY_LJMP(luaL_checklstring(L, 2, &name_len));
+
+	if ((msg->chn->flags & CF_ISRESP) || msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	/* Check length. */
+	if (name_len > trash.size - 1) {
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+
+	/* Add the mark question as prefix. */
+	chunk_reset(&trash);
+	trash.area[trash.data++] = '?';
+	memcpy(trash.area + trash.data, name, name_len);
+	trash.data += name_len;
+
+	s = chn_strm(msg->chn);
+	lua_pushboolean(L, http_req_replace_stline(2, trash.area, trash.data, s->be, s) != -1);
+	return 1;
+}
+
+/* Rewrites the request URI. It relies on http_req_replace_stline(). */
+__LJMP static int hlua_http_msg_set_uri(lua_State *L)
+{
+	struct stream *s;
+	struct http_msg *msg;
+	const char *name;
+	size_t name_len;
+
+	MAY_LJMP(check_args(L, 2, "set_uri"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	name = MAY_LJMP(luaL_checklstring(L, 2, &name_len));
+
+	if ((msg->chn->flags & CF_ISRESP) || msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	s = chn_strm(msg->chn);
+	lua_pushboolean(L, http_req_replace_stline(3, name, name_len, s->be, s) != -1);
+	return 1;
+}
+
+/* Rewrites the response status code. It relies on http_res_set_status(). */
+__LJMP static int hlua_http_msg_set_status(lua_State *L)
+{
+	struct http_msg *msg;
+	unsigned int code;
+	const char *reason;
+	size_t reason_len;
+
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	code = MAY_LJMP(luaL_checkinteger(L, 2));
+	reason = MAY_LJMP(luaL_optlstring(L, 3, NULL, &reason_len));
+
+	if (!(msg->chn->flags & CF_ISRESP) || msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(lua_error(L));
+
+	lua_pushboolean(L, http_res_set_status(code, ist2(reason, reason_len), chn_strm(msg->chn)) != -1);
+	return 1;
+}
+
+/* Returns true if the HTTP message is full. */
+__LJMP static int hlua_http_msg_is_full(lua_State *L)
+{
+	struct http_msg *msg;
+	struct htx *htx;
+
+	MAY_LJMP(check_args(L, 1, "is_full"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	htx = htxbuf(&msg->chn->buf);
+
+	lua_pushboolean(L, (htx_free_data_space(htx) == 0));
+	return 1;
+}
+
+/* Returns true if the HTTP message is empty. */
+__LJMP static int hlua_http_msg_is_empty(lua_State *L)
+{
+	struct http_msg *msg;
+	struct htx *htx;
+
+	MAY_LJMP(check_args(L, 1, "is_full"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	htx = htxbuf(&msg->chn->buf);
+
+	lua_pushboolean(L, htx_is_empty(htx));
+	return 1;
+}
+
+/* Returns the free space in the HTTP message. */
+__LJMP static int hlua_http_msg_free_space(lua_State *L)
+{
+	struct http_msg *msg;
+	struct htx *htx;
+
+	MAY_LJMP(check_args(L, 1, "free_space"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	htx = htxbuf(&msg->chn->buf);
+
+	lua_pushinteger(L, htx_free_data_space(htx));
+	return 1;
+}
+
+/* Returns the number of bytes available in the input side of the HTTP
+ * message. This function never fails.
+ */
+__LJMP static int hlua_http_msg_get_in_len(lua_State *L)
+{
+	struct http_msg *msg;
+	struct htx *htx;
+
+	MAY_LJMP(check_args(L, 1, "get_in_len"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	htx = htxbuf(&msg->chn->buf);
+	lua_pushinteger(L, htx->data - co_data(msg->chn));
+	return 1;
+}
+
+/* Returns the number of bytes available in the output side of the HTTP
+ * message. This function never fails.
+ */
+__LJMP static int hlua_http_msg_get_out_len(lua_State *L)
+{
+	struct http_msg *msg;
+
+	MAY_LJMP(check_args(L, 1, "get_out_len"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	lua_pushinteger(L, co_data(msg->chn));
+	return 1;
+}
+
+/* Copies at most <len> bytes of DATA blocks from the HTTP message <msg>
+ * starting at the offset <offset> and put it in a string LUA variables. Returns
+ * 0 if no data are available, otherwise it returns the length of the builded
+ * string. It stops on the first non-DATA HTX block. This function is called
+ * during the payload filtering, so the headers are already scheduled for output
+ * (from the filter point of view). If nothing was copied, a nil value is pushed
+ * on the stack. Otherwise a LUa string containing copied data is pushed on the
+ * stack.
+ */
+static int _hlua_http_msg_dup(struct http_msg *msg, lua_State *L, size_t offset, size_t len)
+{
+	struct htx *htx = htxbuf(&msg->chn->buf);
+	struct htx_blk *blk;
+	struct htx_ret htxret;
+	luaL_Buffer b;
+	int ret = 0;
+
+	if (unlikely(len == 0))
+		return 0;
+
+	luaL_buffinit(L, &b);
+	htxret = htx_find_offset(htx, offset);
+	for (blk = htxret.blk, offset = htxret.ret; blk && len; blk = htx_get_next_blk(htx, blk)) {
+		enum htx_blk_type type = htx_get_blk_type(blk);
+		struct ist v;
+
+		switch (type) {
+			case HTX_BLK_UNUSED:
+				break;
+
+			case HTX_BLK_DATA:
+				v = htx_get_blk_value(htx, blk);
+				v.ptr += offset;
+				v.len -= offset;
+				if (v.len > len)
+					v.len = len;
+
+				luaL_addlstring(&b, v.ptr, v.len);
+				ret += v.len;
+				break;
+
+			default:
+				goto end;
+		}
+		offset = 0;
+	}
+
+end:
+	luaL_pushresult(&b);
+	if (!ret) {
+		/* Remove the empty string and push nil on the stack */
+		lua_pop(L, 1);
+		lua_pushnil(L);
+	}
+	return ret;
+}
+
+/* Appends as much data as possible from <str> to the HTTP message <msg> at the
+ * offset <offset>. It returns the amount of data written. This function is
+ * responsibile to update the filter context.
+ */
+static int _hlua_http_msg_append(struct http_msg *msg, struct filter *filter, struct ist str, size_t offset)
+{
+	struct htx *htx = htx_from_buf(&msg->chn->buf);
+	struct htx_ret htxret;
+	int max, ret = 0;
+
+	/* Nothing to do, just return */
+	if (unlikely(str.len == 0))
+		goto end;
+
+	/* Check if the buffer is available because HAProxy doesn't allocate
+	 * the request buffer if its not required. */
+	if (b_is_null(&msg->chn->buf)) {
+		si_rx_buff_blk(chn_prod(msg->chn));
+		goto end;
+	}
+
+	/* Adjust the max we can copy */
+	max = htx_free_data_space(htx);
+	if (max < str.len)
+		str.len = max;
+
+	htxret = htx_find_offset(htx, offset);
+	if (!htxret.blk || htx_get_blk_type(htxret.blk) != HTX_BLK_DATA) {
+		if (!htx_add_last_data(htx, str))
+			goto fail;
+	}
+	else {
+		struct ist v = htx_get_blk_value(htx, htxret.blk);
+		v.ptr += htxret.ret;
+		v.len  = 0;
+		if (!htx_replace_blk_value(htx, htxret.blk, v, str))
+			goto fail;
+	}
+	ret = str.len;
+	if (ret) {
+		struct hlua_flt_ctx *flt_ctx = filter->ctx;
+		flt_update_offsets(filter, msg->chn, ret);
+		flt_ctx->cur_len[CHN_IDX(msg->chn)] += ret;
+	}
+
+  end:
+	htx_to_buf(htx, &msg->chn->buf);
+	return ret;
+
+  fail:
+	/* Return an error if nothing was copied while the channel's
+	 * input is already closed */
+	if (channel_input_closed(msg->chn))
+		ret = -1;
+	goto end;
+}
+
+/* Helper function removing at most <len> bytes of DATA blocks at the absolute
+ * position <offset>. It stops on the first non-DATA HTX block. This function is
+ * called during the payload filtering, so the headers are already scheduled for
+ * output (from the filter point of view). This function is responsibile to
+ * update the filter context.
+ */
+static void _hlua_http_msg_erase_data(struct http_msg *msg, struct filter *filter, size_t offset, size_t len)
+{
+	struct hlua_flt_ctx *flt_ctx = filter->ctx;
+	struct htx *htx = htx_from_buf(&msg->chn->buf);
+	struct htx_blk *blk;
+	struct htx_ret htxret;
+	size_t ret = 0;
+
+	/* Be sure <len> is always the amount of DATA to remove */
+	if (htx->data == offset+len && htx_get_tail_type(htx) == HTX_BLK_DATA) {
+		htx_truncate(htx, offset);
+		ret = len;
+		goto end;
+	}
+
+	htxret = htx_find_offset(htx, offset);
+	blk = htxret.blk;
+	if (htxret.ret) {
+		struct ist v;
+
+		if (htx_get_blk_type(blk) != HTX_BLK_DATA)
+			goto end;
+		v = htx_get_blk_value(htx, blk);
+		v.ptr += htxret.ret;
+		if (v.len > len)
+			v.len  = len;
+		blk = htx_replace_blk_value(htx, blk, v, ist2(NULL, 0));
+		len -= v.len;
+		ret += v.len;
+	}
+
+
+	while (blk && len) {
+		enum htx_blk_type type = htx_get_blk_type(blk);
+		uint32_t sz = htx_get_blksz(blk);
+
+		switch (type) {
+			case HTX_BLK_UNUSED:
+				break;
+
+			case HTX_BLK_DATA:
+				if (len < sz) {
+					htx_cut_data_blk(htx, blk, len);
+					ret += len;
+					goto end;
+				}
+				break;
+
+			default:
+				goto end;
+		}
+
+		/* Remove oll the data block */
+		len -= sz;
+		ret += sz;
+		blk = htx_remove_blk(htx, blk);
+	}
+
+end:
+	flt_update_offsets(filter, msg->chn, -ret);
+	flt_ctx->cur_len[CHN_IDX(msg->chn)] -= ret;
+	htx_to_buf(htx, &msg->chn->buf);
+}
+
+/* "_hlua_http_msg_dup" wrapper. Unlike the channel function used to duplicate
+ * raw data, this one can only be called inside a filter, from http_payload
+ * callback. So it cannot yield. An exception is returned if it is called from
+ * another callback. If nothing was copied, a nil value is pushed on the stack.
+ */
+__LJMP static int hlua_http_msg_dup(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	size_t offset, len;
+
+	MAY_LJMP(check_args(L, 1, "dup"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state < HTTP_MSG_DATA)
+		WILL_LJMP(lua_error(L));
+
+	filter = hlua_http_msg_filter(L, 1, msg, &offset, &len);
+	if (!filter || !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
+
+	_hlua_http_msg_dup(msg, L, offset, len);
+	return 1;
+}
+
+/* Does the same than hlua_http_msg_dup() except it removes data copied from the
+ * HTTP message. Unlike the channel function used to get raw data, this one can
+ * only be called inside a filter, from http_payload callback. So it cannot
+ * yield. An exception is returned if it is called from another callback. If
+ * nothing was copied, a nil value is pushed on the stack.
+ */
+__LJMP static int hlua_http_msg_get(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	size_t offset, len;
+	int ret;
+
+	MAY_LJMP(check_args(L, 1, "dup"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state < HTTP_MSG_DATA)
+		WILL_LJMP(lua_error(L));
+
+	filter = hlua_http_msg_filter(L, 1, msg, &offset, &len);
+	if (!filter || !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
+
+	ret = _hlua_http_msg_dup(msg, L, offset, len);
+	if (ret)
+		_hlua_http_msg_erase_data(msg, filter, offset, ret);
+	return 1;
+}
+
+/* "_hlua_http_msg_append" wrapper. It returns the amount of data written or -1
+ * if nothing was copied and the channel's input is closed. Unlike the channel
+ * function used to duplicate raw data, this one can only be called inside a
+ * filter, from http_payload callback. So it cannot yield. An exception is
+ * returned if it is called from another callback.
+ */
+__LJMP static int hlua_http_msg_append(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	const char *str;
+	size_t offset, len, sz;
+	int ret;
+
+	MAY_LJMP(check_args(L, 2, "append"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state < HTTP_MSG_DATA)
+		WILL_LJMP(lua_error(L));
+
+	str = MAY_LJMP(luaL_checklstring(L, 2, &sz));
+	filter = hlua_http_msg_filter(L, 1, msg, &offset, &len);
+	if (!filter || !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
+
+	ret = _hlua_http_msg_append(msg, filter, ist2(str, sz), offset+len);
+	lua_pushinteger(L, ret);
+	return 1;
+}
+
+
+/* Does the same than hlua_http_msg_append() except it first removes existing
+ * data from the HTTP message (respecting the filter offset and length
+ * values). The result is a replacement of the current data. It returns the
+ * amount of data written or -1 if nothing was copied and the channel's input is
+ * closed. Unlike the channel function used to duplicate raw data, this one can
+ * only be called inside a filter, from http_payload callback. So it cannot
+ * yield. An exception is returned if it is called from another callback.
+ */
+__LJMP static int hlua_http_msg_set(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	const char *str;
+	size_t offset, len, sz;
+	int ret;
+
+	MAY_LJMP(check_args(L, 2, "set"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state < HTTP_MSG_DATA)
+		WILL_LJMP(lua_error(L));
+
+	str = MAY_LJMP(luaL_checklstring(L, 2, &sz));
+	filter = hlua_http_msg_filter(L, 1, msg, &offset, &len);
+	if (!filter || !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
+
+	if (len)
+		_hlua_http_msg_erase_data(msg, filter, offset, len);
+	ret = _hlua_http_msg_append(msg, filter, ist2(str, sz), offset);
+	lua_pushinteger(L, ret);
+	return 1;
+}
+
+/* Prepends as much data as possible from a string into an HTTP message at the
+ * filter offset. It returns the amount of data written or -1 if nothing was
+ * copied and the channel's input is closed. It also returns -1 if the channel's
+ * output is closed. Unlike the channel function used to duplicate raw data,
+ * this one can only be called inside a filter, from http_payload callback. So
+ * it cannot yield. An exception is returned if it is called from another
+ * callback.
+ */
+__LJMP static int hlua_http_msg_send(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	const char *str;
+	size_t offset, len, sz;
+	int ret;
+
+	MAY_LJMP(check_args(L, 2, "send"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state < HTTP_MSG_DATA)
+		WILL_LJMP(lua_error(L));
+
+	str = MAY_LJMP(luaL_checklstring(L, 2, &sz));
+	filter = hlua_http_msg_filter(L, 1, msg, &offset, &len);
+	if (!filter || !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
+
+	/* Return an error if the channel's output is closed */
+	if (unlikely(channel_output_closed(msg->chn))) {
+		lua_pushinteger(L, -1);
+		return 1;
+	}
+
+	ret = _hlua_http_msg_append(msg, filter, ist2(str, sz), offset);
+	if (ret > 0) {
+		struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+		flt_ctx->cur_len[CHN_IDX(msg->chn)] -= ret;
+		flt_ctx->cur_off[CHN_IDX(msg->chn)] += ret;
+	}
+
+	lua_pushinteger(L, ret);
+	return 1;
+}
+
+/* Forwards a given amount of bytes. It return -1 if the channel's output is
+ * closed. Otherwise, it returns the number of bytes forwarded. Unlike the
+ * channel function used to duplicate raw data, this one can only be called
+ * inside a filter, from http_payload callback. So it cannot yield. An exception
+ * is returned if it is called from another callback. All other functions deal
+ * with DATA block, this one not.
+*/
+__LJMP static int hlua_http_msg_forward(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	size_t offset, len;
+	int fwd, ret = 0;
+
+	MAY_LJMP(check_args(L, 2, "forward"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	if (msg->msg_state < HTTP_MSG_DATA)
+		WILL_LJMP(lua_error(L));
+
+	fwd = MAY_LJMP(luaL_checkinteger(L, 2));
+	filter = hlua_http_msg_filter(L, 1, msg, &offset, &len);
+	if (!filter || !hlua_filter_from_payload(filter))
+		WILL_LJMP(lua_error(L));
+
+	/* Nothing to do, just return */
+	if (!fwd)
+		goto end;
+
+	/* Return an error if the channel's output is closed */
+	if (unlikely(channel_output_closed(msg->chn))) {
+		ret = -1;
+		goto end;
+	}
+
+	ret = fwd;
+	if (ret > len)
+		ret = len;
+
+	if (ret) {
+		struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+		FLT_OFF(filter, msg->chn) += ret;
+		flt_ctx->cur_off[CHN_IDX(msg->chn)] += ret;
+		flt_ctx->cur_len[CHN_IDX(msg->chn)] -= ret;
+	}
+
+  end:
+	lua_pushinteger(L, ret);
+	return 1;
 }
 
 /*
@@ -10049,6 +10862,50 @@ lua_State *hlua_init_state(int thread_num)
 	/* Register previous table in the registry with reference and named entry. */
 	class_http_ref = hlua_register_metatable(L, CLASS_HTTP);
 
+	/*
+	 *
+	 * Register class HTTPMessage
+	 *
+	 */
+
+	/* Create and fill the metatable. */
+	lua_newtable(L);
+
+	/* Create and fille the __index entry. */
+	lua_pushstring(L, "__index");
+	lua_newtable(L);
+
+	/* Register Lua functions. */
+	hlua_class_function(L, "is_resp",     hlua_http_msg_is_resp);
+	hlua_class_function(L, "get_stline",  hlua_http_msg_get_stline);
+	hlua_class_function(L, "get_headers", hlua_http_msg_get_headers);
+	hlua_class_function(L, "del_header",  hlua_http_msg_del_hdr);
+	hlua_class_function(L, "rep_header",  hlua_http_msg_rep_hdr);
+	hlua_class_function(L, "rep_value",   hlua_http_msg_rep_val);
+	hlua_class_function(L, "add_header",  hlua_http_msg_add_hdr);
+	hlua_class_function(L, "set_header",  hlua_http_msg_set_hdr);
+	hlua_class_function(L, "set_method",  hlua_http_msg_set_meth);
+	hlua_class_function(L, "set_path",    hlua_http_msg_set_path);
+	hlua_class_function(L, "set_query",   hlua_http_msg_set_query);
+	hlua_class_function(L, "set_uri",     hlua_http_msg_set_uri);
+	hlua_class_function(L, "set_status",  hlua_http_msg_set_status);
+
+	hlua_class_function(L, "get",         hlua_http_msg_get);
+	hlua_class_function(L, "dup",         hlua_http_msg_dup);
+	hlua_class_function(L, "set",         hlua_http_msg_set);
+	hlua_class_function(L, "append",      hlua_http_msg_append);
+	hlua_class_function(L, "send",        hlua_http_msg_send);
+	hlua_class_function(L, "forward",     hlua_http_msg_forward);
+	hlua_class_function(L, "get_in_len",  hlua_http_msg_get_in_len);
+	hlua_class_function(L, "get_out_len", hlua_http_msg_get_out_len);
+	hlua_class_function(L, "is_full",     hlua_http_msg_is_full);
+	hlua_class_function(L, "is_emtpy",    hlua_http_msg_is_empty);
+	hlua_class_function(L, "free_space",  hlua_http_msg_free_space);
+
+	lua_rawset(L, -3);
+
+	/* Register previous table in the registry with reference and named entry. */
+	class_http_msg_ref = hlua_register_metatable(L, CLASS_HTTP_MSG);
 	/*
 	 *
 	 * Register class AppletTCP
