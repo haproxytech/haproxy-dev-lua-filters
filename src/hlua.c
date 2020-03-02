@@ -261,6 +261,7 @@ static int class_fetches_ref;
 static int class_converters_ref;
 static int class_http_ref;
 static int class_http_msg_ref;
+static int class_http_blk_ref;
 static int class_map_ref;
 static int class_applet_tcp_ref;
 static int class_applet_http_ref;
@@ -329,6 +330,9 @@ static int hlua_smp2lua_str(lua_State *L, struct sample *smp);
 static int hlua_lua2smp(lua_State *L, int ud, struct sample *smp);
 
 __LJMP static int hlua_http_get_headers(lua_State *L, struct http_msg *msg);
+
+static int hlua_http_blk_new(lua_State *L, int msg_idx, struct htx_blk *blk, size_t off, size_t len);
+__LJMP static struct htx_blk *hlua_checkhttpblock(lua_State *L, int ud);
 
 struct prepend_path {
 	struct list l;
@@ -6630,6 +6634,604 @@ __LJMP static int hlua_http_msg_forward(lua_State *L)
 	return 1;
 }
 
+/* Internal iterator function to iter on blocks of an HTX message */
+__LJMP static int hlua_http_msg_iter_blocks(lua_State *L)
+{
+	struct http_msg *msg;
+	struct htx *htx;
+	struct htx_blk *blk;
+	size_t offset, len;
+	int idx, cur_off, cur_len;
+
+	MAY_LJMP(check_args(L, 2, "iter_blocks"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	htx = htxbuf(&msg->chn->buf);
+	if (htx_is_empty(htx))
+		goto last_iter;
+
+	/* control value to iter on HTX blocks */
+	luaL_checktype(L, 2, LUA_TTABLE);
+	if (lua_geti(L, 2, 0) != LUA_TNUMBER ||
+	    lua_geti(L, 2, 1) != LUA_TNUMBER ||
+	    lua_geti(L, 2, 2) != LUA_TNUMBER)
+		WILL_LJMP(lua_error(L));
+	idx      = lua_tointeger(L, -3);
+	cur_off  = lua_tointeger(L, -2);
+	cur_len  = lua_tointeger(L, -1);
+	lua_pop(L, 3);
+
+	if (!cur_len)
+		goto last_iter;
+
+	if (msg->msg_state < HTTP_MSG_DATA) {
+		idx = ((idx == -1) ? htx_get_first(htx) : htx_get_next(htx, idx));
+		if (idx == -1)
+			goto last_iter;
+
+		blk = htx_get_blk(htx, idx);
+		offset = 0;
+		len = htx_get_blksz(blk);
+		if (len > cur_len)
+			len = cur_len;
+	}
+	else {
+		if (idx == -1) {
+			struct htx_ret htxret = htx_find_offset(htx, cur_off);
+
+			if (!htxret.blk)
+				goto last_iter;
+			blk = htxret.blk;
+			idx = htx_get_blk_pos(htx, htxret.blk);
+			offset = htxret.ret;
+		}
+		else {
+			idx = htx_get_next(htx, idx);
+			if (idx == -1)
+				goto last_iter;
+			blk = htx_get_blk(htx, idx);
+			offset = 0;
+		}
+
+		len = htx_get_blksz(blk) - offset;
+		if (len > cur_len)
+			len = cur_len;
+	}
+
+	/* Push new control value and the result of this iteration */
+	lua_newtable(L);
+	lua_pushinteger(L, idx);
+	lua_rawseti(L, -2, 0);
+	lua_pushinteger(L, 0);
+	lua_rawseti(L, -2, 1);
+	lua_pushinteger(L, cur_len-len);
+	lua_rawseti(L, -2, 2);
+	hlua_http_blk_new(L, 1, blk, offset, cur_len);
+	return 2;
+
+  last_iter:
+	return 0;
+}
+
+/* Initialises the HTX blocks iterator. It returns the function to iters and the
+ * initial control value used to iter.
+ */
+__LJMP static int hlua_http_msg_blocks(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	size_t offset, len;
+
+	MAY_LJMP(check_args(L, 1, "blocks"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	filter = hlua_http_msg_filter(L, 1, msg, &offset, &len);
+	if (!filter)
+		WILL_LJMP(lua_error(L));
+
+	lua_pushcfunction(L, hlua_http_msg_iter_blocks);
+	lua_insert(L, -2);
+
+	/* Create the initial control value used to iter. */
+	lua_newtable(L);
+	lua_pushinteger(L, -1);     // idx == -1 to init the loop
+	lua_rawseti(L, -2, 0);
+	lua_pushinteger(L, offset); // offset
+	lua_rawseti(L, -2, 1);
+	lua_pushinteger(L, len);    // length
+	lua_rawseti(L, -2, 2);
+
+	return 3;
+}
+
+/* Returns the first HTX block of an HTX message. The returned block depends on
+ * the context. During headers filtering, the first index is used. During the
+ * payload filtering, we use the forwarding offset. In this case, the forwarding
+ * length is used to limit calls to next().
+ */
+__LJMP static int hlua_http_msg_first(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	struct htx *htx;
+	struct htx_blk *blk;
+	size_t offset, len;
+
+	MAY_LJMP(check_args(L, 1, "first"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	filter = hlua_http_msg_filter(L, 1, msg, &offset, &len);
+	if (!filter)
+		WILL_LJMP(lua_error(L));
+
+	htx = htxbuf(&msg->chn->buf);
+	if (htx_is_empty(htx))
+		goto not_found;
+
+	if (msg->msg_state < HTTP_MSG_DATA) {
+		blk = htx_get_first_blk(htx);
+		offset = 0;
+	}
+	else {
+		struct htx_ret htxret = htx_find_offset(htx, offset);
+		blk = htxret.blk;
+		offset = htxret.ret;
+	}
+	if (!blk)
+		goto not_found;
+
+	hlua_http_blk_new(L, 1, blk, offset, len);
+	return 1;
+
+  not_found:
+	return 0;
+}
+
+/* Returns the HTX block following the one passed in parameter. Depending on the
+ * forwarding length, the block may exist but nil is returned. */
+__LJMP static int hlua_http_msg_next(lua_State *L)
+{
+	struct http_msg *msg;
+	struct htx *htx;
+	struct htx_blk *blk;
+	size_t len, iter_len;
+
+	MAY_LJMP(check_args(L, 2, "next"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	blk = MAY_LJMP(hlua_checkhttpblock(L, 2));
+
+	if (lua_getfield(L, 2, "length") != LUA_TNUMBER ||
+	    lua_getfield(L, 2, "__iter_length") != LUA_TNUMBER)
+		WILL_LJMP(lua_error(L));
+	len = lua_tointeger(L, -2);
+	iter_len = lua_tointeger(L, -1);
+	lua_pop(L, 2);
+
+	htx = htxbuf(&msg->chn->buf);
+	if (htx_is_empty(htx))
+		goto not_found;
+
+	iter_len -= len;
+	if (!iter_len)
+		goto not_found;
+
+	blk = htx_get_next_blk(htx, blk);
+	if (!blk)
+		goto not_found;
+
+	hlua_http_blk_new(L, 1, blk, 0, iter_len);
+	return 1;
+
+  not_found:
+	return 0;
+}
+
+/* Returns the number of used blocks in an HTTP message */
+__LJMP static int hlua_http_msg_nb_blocks(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	size_t offset, len;
+
+	MAY_LJMP(check_args(L, 2, "nb_blocks"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+
+	filter = hlua_http_msg_filter(L, 1, msg, &offset, &len);
+	if (!filter)
+		WILL_LJMP(lua_error(L));
+	lua_pushinteger(L, htx_nbblks(htxbuf(&msg->chn->buf)));
+	return 1;
+}
+
+/*
+ *
+ *
+ * Class HTTPBlock
+ *
+ *
+ */
+
+/* Returns a struct htx_blk if the stack entry "ud" is a class HTTPBlock,
+ * otherwise it throws an error.
+ */
+__LJMP static struct htx_blk *hlua_checkhttpblock(lua_State *L, int ud)
+{
+	return MAY_LJMP(hlua_checkudata(L, ud, class_http_blk_ref));
+}
+
+static struct http_msg *hlua_http_blk_http_msg(lua_State *L, int ud)
+{
+	struct http_msg *msg = NULL;
+
+	if (lua_getfield(L, ud, "__http_msg") == LUA_TTABLE) {
+		lua_rawgeti(L, -1, 0);
+		msg = lua_touserdata(L, -1);
+		lua_pop(L, 1);
+	}
+	lua_pop(L, 1);
+	return msg;
+}
+
+static struct filter *hlua_http_blk_filter(lua_State *L, int ud)
+{
+	struct filter *filter = NULL;
+
+	if (lua_getfield(L, ud, "__http_msg") == LUA_TTABLE) {
+		if (lua_getfield(L, -1, "__filter") == LUA_TLIGHTUSERDATA)
+			filter  = lua_touserdata (L, -1);
+		lua_pop(L, 1);
+	}
+	lua_pop(L, 1);
+	return filter;
+}
+
+/* Creates and pushes on the stack a HTTP block object. <off> is the first byte
+ * of readable data in the HTX block. It is greater than 0 for DATA blocks
+ * only. <iter_len> is the reading length, used as internal context in iteration
+ * loop, when next() is called. It contains the current block size.
+ */
+static int hlua_http_blk_new(lua_State *L, int msg_idx, struct htx_blk *blk, size_t off, size_t iter_len)
+{
+	/* Check stack size. */
+	if (!lua_checkstack(L, 3))
+		return 0;
+
+	lua_newtable(L);
+	lua_pushlightuserdata(L, blk);
+	lua_rawseti(L, -2, 0);
+
+	// The block type
+	lua_pushstring(L, "type");
+	lua_pushinteger(L, htx_get_blk_type(blk));
+	lua_rawset(L, -3);
+
+	// The total block size
+	lua_pushstring(L, "size");
+	lua_pushinteger(L, htx_get_blksz(blk));
+	lua_rawset(L, -3);
+
+	// The readable block length
+	lua_pushstring(L, "length");
+	lua_pushinteger(L, MIN(iter_len, htx_get_blksz(blk) - off));
+	lua_rawset(L, -3);
+
+	// The offset of the first readable byte
+	lua_pushstring(L, "offset");
+	lua_pushinteger(L, off);
+	lua_rawset(L, -3);
+
+	// The remains length of readble bytes in the message, used to iter
+	lua_pushstring(L, "__iter_length");
+	lua_pushinteger(L, iter_len);
+	lua_rawset(L, -3);
+
+	// The owning HTTP message
+	lua_pushstring(L, "__http_msg");
+	lua_pushvalue(L, msg_idx);
+	lua_rawset(L, -3);
+
+	/* Pop a class stream metatable and affect it to the table. */
+	lua_rawgeti(L, LUA_REGISTRYINDEX, class_http_blk_ref);
+	lua_setmetatable(L, -2);
+
+	return 1;
+}
+
+static int _hlua_http_blk_replace(lua_State *L, struct htx_blk *blk, size_t start, size_t sz, struct ist str)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	struct htx *htx;
+	struct ist value;
+	size_t offset, len, iter_len;
+	int32_t delta;
+
+	if (htx_get_blk_type(blk) != HTX_BLK_DATA)
+		return -1;
+
+	msg = hlua_http_blk_http_msg(L, 1);
+	filter = hlua_http_blk_filter(L, 1);
+	if (!msg || !filter || !hlua_filter_from_payload(filter))
+		return -1;
+
+	if (lua_getfield(L, 1, "offset") != LUA_TNUMBER ||
+	    lua_getfield(L, 1, "length") != LUA_TNUMBER ||
+	    lua_getfield(L, 1, "__iter_length") != LUA_TNUMBER)
+		return -1;
+	offset = lua_tointeger(L, -3);
+	len = lua_tointeger(L, -2);
+	iter_len = lua_tointeger(L, -1);
+	lua_pop(L, 3);
+
+	if (start > len || start+sz > len)
+		return -1;
+
+	htx = htxbuf(&msg->chn->buf);
+	value = htx_get_blk_value(htx, blk);
+	value.ptr += offset+start;
+	value.len  = sz;
+
+	blk = htx_replace_blk_value(htx, blk, value, str);
+	if (!blk)
+		return 0;
+
+	delta = str.len - value.len;
+	len += delta;
+	iter_len += delta;
+
+	if (hlua_filter_from_payload(filter)) {
+		struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+		flt_update_offsets(filter, msg->chn, delta);
+		flt_ctx->cur_len[CHN_IDX(msg->chn)] += delta;
+	}
+
+	htx_to_buf(htx, &msg->chn->buf);
+	if (!blk)
+		return 0;
+
+	lua_pushvalue(L, 1);
+	lua_pushlightuserdata(L, blk);
+	lua_seti(L, -2, 0);
+	lua_pushinteger(L, htx_get_blk_type(blk));
+	lua_setfield(L, -2, "type");
+	lua_pushinteger(L, htx_get_blksz(blk));
+	lua_setfield(L, -2, "size");
+	lua_pushinteger(L, offset);
+	lua_setfield(L, -2, "offset");
+	lua_pushinteger(L, len);
+	lua_setfield(L, -2, "length");
+	lua_pushinteger(L, iter_len);
+	lua_setfield(L, -2, "__iter_length");
+	return 1;
+}
+
+__LJMP static int hlua_http_blk_remove(lua_State *L)
+{
+	struct http_msg *msg;
+	struct filter *filter;
+	struct htx *htx;
+	struct htx_blk *blk;
+	size_t offset, len, iter_len;
+
+	MAY_LJMP(check_args(L, 1, "remove"));
+	blk = MAY_LJMP(hlua_checkhttpblock(L, 1));
+
+	msg = hlua_http_blk_http_msg(L, 1);
+	filter = hlua_http_blk_filter(L, 1);
+	if (!msg || !filter)
+		WILL_LJMP(lua_error(L));
+
+	if (lua_getfield(L, 1, "offset") != LUA_TNUMBER ||
+	    lua_getfield(L, 1, "length") != LUA_TNUMBER ||
+	    lua_getfield(L, 1, "__iter_length") != LUA_TNUMBER)
+		return -1;
+	offset = lua_tointeger(L, -3);
+	len = lua_tointeger(L, -2);
+	iter_len = lua_tointeger(L, -1);
+	lua_pop(L, 3);
+
+	htx = htxbuf(&msg->chn->buf);
+	if (!offset && len == htx_get_blksz(blk)) {
+		blk = htx_remove_blk(htx, blk);
+		iter_len -= len;
+	}
+	else {
+		struct ist value = htx_get_blk_value(htx, blk);
+
+		value.ptr += offset;
+		value.len = len;
+		blk = htx_replace_blk_value(htx, blk, value, ist(""));
+		offset = 0;
+		iter_len -= len;
+		blk = (iter_len ? htx_get_next_blk(htx, blk)  : NULL);
+
+	}
+
+	if (hlua_filter_from_payload(filter)) {
+		struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+		flt_update_offsets(filter, msg->chn, -len);
+		flt_ctx->cur_len[CHN_IDX(msg->chn)] -= len;
+	}
+
+	htx_to_buf(htx, &msg->chn->buf);
+	if (!blk)
+		return 0;
+
+	len = MIN(iter_len, htx_get_blksz(blk) - offset);
+
+	lua_pushvalue(L, 1);
+	lua_pushlightuserdata(L, blk);
+	lua_seti(L, -2, 0);
+	lua_pushinteger(L, htx_get_blk_type(blk));
+	lua_setfield(L, -2, "type");
+	lua_pushinteger(L, htx_get_blksz(blk));
+	lua_setfield(L, -2, "size");
+	lua_pushinteger(L, offset);
+	lua_setfield(L, -2, "offset");
+	lua_pushinteger(L, len);
+	lua_setfield(L, -2, "length");
+	lua_pushinteger(L, iter_len);
+	lua_setfield(L, -2, "__iter_length");
+	return 1;
+}
+
+__LJMP static int hlua_http_blk_set(lua_State *L)
+{
+	struct htx_blk *blk;
+	const char *str;
+	size_t sz, len;
+	int ret;
+
+	MAY_LJMP(check_args(L, 2, "set"));
+	blk = MAY_LJMP(hlua_checkhttpblock(L, 1));
+
+	if (lua_getfield(L, 1, "length") != LUA_TNUMBER)
+		WILL_LJMP(lua_error(L));
+	len = lua_tointeger(L, -1);
+	lua_pop(L, 1);
+
+	str = MAY_LJMP(luaL_checklstring(L, 2, &sz));
+
+	ret = _hlua_http_blk_replace(L, blk, 0, len, ist2(str, sz));
+	if (ret == -1)
+		WILL_LJMP(lua_error(L));
+	return ret;
+}
+
+__LJMP static int hlua_http_blk_replace(lua_State *L)
+{
+	struct htx_blk *blk;
+	const char *str;
+	size_t sz, start, len;
+	int ret;
+
+	MAY_LJMP(check_args(L, 4, "replace"));
+	blk = MAY_LJMP(hlua_checkhttpblock(L, 1));
+
+	start = MAY_LJMP(luaL_checkinteger(L, 2));
+	len = MAY_LJMP(luaL_checkinteger(L, 3));
+	str = MAY_LJMP(luaL_checklstring(L, 4, &sz));
+
+	ret = _hlua_http_blk_replace(L, blk, start, len, ist2(str, sz));
+	if (ret == -1)
+		WILL_LJMP(lua_error(L));
+	return ret;
+}
+
+__LJMP static int hlua_http_blk_insert(lua_State *L)
+{
+	struct htx_blk *blk;
+	const char *str;
+	size_t start, sz;
+	int ret;
+
+	MAY_LJMP(check_args(L, 3, "insert"));
+	blk = MAY_LJMP(hlua_checkhttpblock(L, 1));
+
+	start = MAY_LJMP(luaL_checkinteger(L, 2));
+	str = MAY_LJMP(luaL_checklstring(L, 3, &sz));
+
+	ret = _hlua_http_blk_replace(L, blk, start, 0, ist2(str, sz));
+	if (ret == -1)
+		WILL_LJMP(lua_error(L));
+	return ret;
+}
+
+__LJMP static int hlua_http_blk_append(lua_State *L)
+{
+	struct htx_blk *blk;
+	const char *str;
+	size_t offset, sz, len;
+	int ret;
+
+	MAY_LJMP(check_args(L, 2, "append"));
+	blk = MAY_LJMP(hlua_checkhttpblock(L, 1));
+
+	if (lua_getfield(L, 1, "offset") != LUA_TNUMBER ||
+	    lua_getfield(L, 1, "length") != LUA_TNUMBER)
+		WILL_LJMP(lua_error(L));
+	offset = lua_tointeger(L, -2);
+	len = lua_tointeger(L, -1);
+	lua_pop(L, 2);
+
+	str = MAY_LJMP(luaL_checklstring(L, 2, &sz));
+
+	ret = _hlua_http_blk_replace(L, blk, offset+len, 0, ist2(str, sz));
+	if (ret == -1)
+		WILL_LJMP(lua_error(L));
+	return ret;
+}
+
+__LJMP static int hlua_http_blk_prepend(lua_State *L)
+{
+	struct htx_blk *blk;
+	const char *str;
+	size_t sz;
+	int ret;
+
+	MAY_LJMP(check_args(L, 2, "prepend"));
+	blk = MAY_LJMP(hlua_checkhttpblock(L, 1));
+
+	str = MAY_LJMP(luaL_checklstring(L, 2, &sz));
+
+	ret = _hlua_http_blk_replace(L, blk, 0, 0, ist2(str, sz));
+	if (ret == -1)
+		WILL_LJMP(lua_error(L));
+	return ret;
+}
+
+__LJMP static int hlua_http_blk_data(lua_State *L)
+{
+	struct http_msg *msg;
+	struct htx_blk *blk;
+	enum htx_blk_type type;
+	struct ist name, value;
+
+	MAY_LJMP(check_args(L, 1, "data"));
+	blk = MAY_LJMP(hlua_checkhttpblock(L, 1));
+
+	msg = hlua_http_blk_http_msg(L, 1);
+	if (!msg)
+		WILL_LJMP(lua_error(L));
+
+	type = htx_get_blk_type(blk);
+	if (type == HTX_BLK_REQ_SL || type == HTX_BLK_RES_SL)
+		hlua_http_get_stline(L, htx_get_blk_ptr(htxbuf(&msg->chn->buf), blk));
+	else if (type == HTX_BLK_HDR || type == HTX_BLK_TLR) {
+		name = htx_get_blk_name(htxbuf(&msg->chn->buf), blk);
+		value = htx_get_blk_value(htxbuf(&msg->chn->buf), blk);
+
+		lua_newtable(L);
+		lua_pushstring(L, "name");
+		lua_pushlstring(L, name.ptr, name.len);
+		lua_settable(L, -3);
+		lua_pushstring(L, "value");
+		lua_pushlstring(L, value.ptr, value.len);
+		lua_settable(L, -3);
+	}
+	else if (type == HTX_BLK_DATA) {
+		size_t offset, len;
+
+		if (lua_getfield(L, 1, "offset") != LUA_TNUMBER ||
+		    lua_getfield(L, 1, "length") != LUA_TNUMBER)
+			WILL_LJMP(lua_error(L));
+		offset = lua_tointeger(L, -2);
+		len = lua_tointeger(L, -1);
+		lua_pop(L, 2);
+
+		value = htx_get_blk_value(htxbuf(&msg->chn->buf), blk);
+		value.ptr += offset;
+		value.len = len;
+		lua_pushlstring(L, value.ptr, value.len);
+	}
+	else
+		return 0;
+
+	return 1;
+}
+
 /*
  *
  *
@@ -11218,10 +11820,67 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "is_emtpy",    hlua_http_msg_is_empty);
 	hlua_class_function(L, "free_space",  hlua_http_msg_free_space);
 
+	hlua_class_function(L, "blocks",      hlua_http_msg_blocks);
+
+	hlua_class_function(L, "first",       hlua_http_msg_first);
+	hlua_class_function(L, "next",        hlua_http_msg_next);
+
 	lua_rawset(L, -3);
+
+	hlua_class_function(L, "__len",       hlua_http_msg_nb_blocks);
 
 	/* Register previous table in the registry with reference and named entry. */
 	class_http_msg_ref = hlua_register_metatable(L, CLASS_HTTP_MSG);
+
+
+	/*
+	 *
+	 * Register class HTTPBlock
+	 *
+	 */
+
+	/* This table entry is the object "HTTPBlock" base. */
+	lua_newtable(L);
+
+	hlua_class_const_int(L, "HTTP_BLOCK_REQ_SL", HTX_BLK_REQ_SL);
+	hlua_class_const_int(L, "HTTP_BLOCK_RES_SL", HTX_BLK_RES_SL);
+	hlua_class_const_int(L, "HTTP_BLOCK_HDR",    HTX_BLK_HDR);
+	hlua_class_const_int(L, "HTTP_BLOCK_EOH",    HTX_BLK_EOH);
+	hlua_class_const_int(L, "HTTP_BLOCK_DATA",   HTX_BLK_DATA);
+	hlua_class_const_int(L, "HTTP_BLOCK_TLR",    HTX_BLK_TLR);
+	hlua_class_const_int(L, "HTTP_BLOCK_EOT",    HTX_BLK_EOT);
+	hlua_class_const_int(L, "HTTP_BLOCK_UNUSED", HTX_BLK_UNUSED);
+
+	/* Create and fill the metatable. */
+	lua_newtable(L);
+
+	/* Create and fille the __index entry. */
+	lua_pushstring(L, "__index");
+	lua_newtable(L);
+
+	hlua_class_function(L, "remove",     hlua_http_blk_remove);
+	hlua_class_function(L, "set",        hlua_http_blk_set);
+	hlua_class_function(L, "replace",    hlua_http_blk_replace);
+	hlua_class_function(L, "insert",     hlua_http_blk_insert);
+	hlua_class_function(L, "append",     hlua_http_blk_append);
+	hlua_class_function(L, "prepend",    hlua_http_blk_prepend);
+
+	hlua_class_function(L, "data",       hlua_http_blk_data);
+
+	/* Register Lua functions. */
+	lua_rawset(L, -3);
+
+	/* Register previous table in the registry with reference and named entry. */
+	lua_pushvalue(L, -1); /* Copy the -1 entry and push it on the stack. */
+	class_http_blk_ref = hlua_register_metatable(L, CLASS_HTTP_BLOCK);
+
+	/* Assign the metatable to the HTTPBlock object. */
+	lua_setmetatable(L, -2);
+
+	/* Set a name to the table. */
+	lua_setglobal(L, "HTTPBlock");
+
+
 	/*
 	 *
 	 * Register class AppletTCP
