@@ -43,6 +43,7 @@
 #define CLASS_CHANNEL      "Channel"
 #define CLASS_HTTP         "HTTP"
 #define CLASS_HTTP_MSG     "HTTPMessage"
+#define CLASS_HTTP_BLOCK   "HTTPBlock"
 #define CLASS_MAP          "Map"
 #define CLASS_APPLET_TCP   "AppletTCP"
 #define CLASS_APPLET_HTTP  "AppletHTTP"
