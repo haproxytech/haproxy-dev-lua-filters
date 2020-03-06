@@ -9820,6 +9820,7 @@ static int hlua_filter_new(struct stream *s, struct filter *filter)
 			goto end;
 		}
 
+		// TODO: If new is not found, just duplicate the filter object ?
 		lua_rawgeti(s->hlua->T, LUA_REGISTRYINDEX, conf->ref);
 		if (lua_getfield(s->hlua->T, -1, "new") != LUA_TFUNCTION) {
 			SEND_ERR(s->be, "Lua filter '%s': 'new' field is not a function.\n",
@@ -11053,6 +11054,8 @@ void hlua_init(void)
 	hlua_class_function(gL.T, "set_uri",     hlua_http_msg_set_uri);
 	hlua_class_function(gL.T, "set_status",  hlua_http_msg_set_status);
 
+	// TODO: find_header /  (full ou pas full)
+
 	hlua_class_function(gL.T, "get",         hlua_http_msg_get);
 	hlua_class_function(gL.T, "dup",         hlua_http_msg_dup);
 	hlua_class_function(gL.T, "set",         hlua_http_msg_set);
@@ -11110,6 +11113,9 @@ void hlua_init(void)
 	hlua_class_function(gL.T, "insert",     hlua_http_blk_insert);
 	hlua_class_function(gL.T, "append",     hlua_http_blk_append);
 	hlua_class_function(gL.T, "prepend",    hlua_http_blk_prepend);
+
+	// TODO: update de valeur de header (replace_header ou hdr_replace ou replace_hdr ...)
+	// TODO: iter on  header_value  + remove ou replace de value
 
 	hlua_class_function(gL.T, "data",       hlua_http_blk_data);
 
