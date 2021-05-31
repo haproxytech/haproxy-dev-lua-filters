@@ -33,6 +33,7 @@
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
 #include <haproxy/connection.h>
+#include <haproxy/filters.h>
 #include <haproxy/h1.h>
 #include <haproxy/hlua.h>
 #include <haproxy/hlua_fcn.h>
@@ -195,6 +196,37 @@ lua_State *hlua_init_state(int thread_id);
  */
 static lua_State *hlua_states[MAX_THREADS + 1];
 
+
+#define HLUA_FLT_CTX_FL_PAYLOAD  0x00000001
+
+struct hlua_filter  {
+	char *name;
+	int flt_ref[MAX_THREADS + 1];
+	int fun_ref[MAX_THREADS + 1];
+	struct list l;
+};
+
+struct hlua_flt_config {
+	struct hlua_filter *hflt;
+	char **args;
+};
+
+struct hlua_flt_ctx {
+	int ref;                 /* ref to the filter lua object */
+	struct hlua *hlua[2];    /* lua runtime context (0: request, 1: response) */
+	unsigned int cur_off[2]; /* current offset (0: request, 1: response) */
+	unsigned int cur_len[2]; /* current forwardable length (0: request, 1: response) */
+	unsigned int flags;      /* HLUA_FLT_CTX_FL_* */
+};
+
+DECLARE_STATIC_POOL(pool_head_hlua_flt_ctx, "hlua_flt_ctx", sizeof(struct hlua_flt_ctx));
+
+/* This is the chained list of struct hlua_flt referenced
+ * for haproxy filters. It is used for a post-initialisation control.
+ */
+static struct list referenced_filters = LIST_HEAD_INIT(referenced_filters);
+
+
 /* This is the memory pool containing struct lua for applets
  * (including cli).
  */
@@ -332,6 +364,41 @@ static inline void release_hlua_function(struct hlua_function *fcn)
 static inline int fcn_ref_to_stack_id(struct hlua_function *fcn)
 {
 	if (fcn->function_ref[0] == -1)
+		return tid + 1;
+	return 0;
+}
+
+
+static inline struct hlua_filter *new_hlua_filter()
+{
+	struct hlua_filter *hflt;
+	int i;
+
+	hflt = calloc(1, sizeof(*hflt));
+	if (!hflt)
+		return NULL;
+	LIST_APPEND(&referenced_filters, &hflt->l);
+	for (i = 0; i < MAX_THREADS + 1; i++) {
+		hflt->flt_ref[i] = -1;
+		hflt->fun_ref[i] = -1;
+	}
+	return hflt;
+}
+
+static inline void release_hlua_filter(struct hlua_filter *hflt)
+{
+	if (!hflt)
+		return;
+	if (hflt->name)
+		ha_free(&hflt->name);
+	LIST_DELETE(&hflt->l);
+	ha_free(&hflt);
+}
+
+/* If the common state is set, the stack id is 0, otherwise it is the tid + 1 */
+static inline int flt_ref_to_stack_id(struct hlua_filter *hflt)
+{
+	if (hflt->fun_ref[0] == -1)
 		return tid + 1;
 	return 0;
 }
@@ -8297,6 +8364,418 @@ __LJMP static int hlua_register_cli(lua_State *L)
 	return 0; /* Never reached */
 }
 
+static int hlua_filter_init(struct proxy *px, struct flt_conf *fconf)
+{
+	struct hlua_flt_config *conf = fconf->conf;
+	lua_State *L;
+	int error, pos, state_id, flt_ref;
+
+	state_id = flt_ref_to_stack_id(conf->hflt);
+	L = hlua_states[state_id];
+
+	pos = lua_gettop(L);
+
+	/* The filter parsing function */
+	lua_rawgeti(L, LUA_REGISTRYINDEX, conf->hflt->fun_ref[state_id]);
+
+	/* Push the filter class on the stack and resolve all callbacks */
+	lua_rawgeti(L, LUA_REGISTRYINDEX, conf->hflt->flt_ref[state_id]);
+
+	/* Duplicate the filter class so each filter will have its own copy */
+	lua_newtable(L);
+	lua_pushnil(L);
+
+        while (lua_next(L, pos+2)) {
+		lua_pushvalue(L, -2);
+		lua_insert(L, -2);
+		lua_settable(L, -4);
+	}
+
+	flt_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	/* Remove the original lua filter class from the stack */
+	lua_pop(L, 1);
+
+	/* Push the copy on the stack */
+	lua_rawgeti(L, LUA_REGISTRYINDEX, flt_ref);
+
+	/* extra args are pushed in a table */
+	lua_newtable(L);
+	for (pos = 0; conf->args[pos]; pos++) {
+		/* Check stack available size. */
+		if (!lua_checkstack(L, 1)) {
+			ha_alert("Lua filter '%s' : Lua error : full stack.", conf->hflt->name);
+			goto error;
+		}
+		lua_pushstring(L, conf->args[pos]);
+		lua_rawseti(L, -2, lua_rawlen(L, -2) + 1);
+	}
+
+	error = lua_pcall(L, 2, LUA_MULTRET, 0);
+	switch (error) {
+	case LUA_OK:
+		/* replace the filter ref */
+		conf->hflt->flt_ref[hlua_state_id] = flt_ref;
+		break;
+	case LUA_ERRRUN:
+		ha_alert("Lua filter '%s' : runtime error : %s", conf->hflt->name, lua_tostring(L, -1));
+		goto error;
+	case LUA_ERRMEM:
+		ha_alert("Lua filter '%s' : out of memory error", conf->hflt->name);
+		goto error;
+	case LUA_ERRERR:
+		ha_alert("Lua filter '%s' : message handler error : %s", conf->hflt->name, lua_tostring(L, -1));
+		goto error;
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM <= 503
+	case LUA_ERRGCMM:
+		ha_alert("Lua filter '%s' : garbage collector error : %s", conf->hflt->name, lua_tostring(L, -1));
+		goto error;
+#endif
+	default:
+		ha_alert("Lua filter '%s' : unknonwn error : %s", conf->hflt->name, lua_tostring(L, -1));
+		goto error;
+	}
+
+	lua_settop(L, 0);
+	return 0;
+
+  error:
+	lua_settop(L, 0);
+	return -1;
+}
+
+static void hlua_filter_deinit(struct proxy *px, struct flt_conf *fconf)
+{
+	struct hlua_flt_config *conf = fconf->conf;
+	int pos;
+
+	if (conf) {
+		release_hlua_filter(conf->hflt);
+		for (pos = 0; conf->args[pos]; pos++)
+			free(conf->args[pos]);
+		free(conf->args);
+	}
+	ha_free(&fconf->conf);
+	ha_free((char **)&fconf->id);
+	ha_free(&fconf->ops);
+}
+
+static int hlua_filter_new(struct stream *s, struct filter *filter)
+{
+	struct hlua_flt_config *conf = FLT_CONF(filter);
+	struct hlua_flt_ctx *flt_ctx = NULL;
+	int ret = 1;
+
+	/* In the execution wrappers linked with a stream, the
+	 * Lua context can be not initialized. This behavior
+	 * permits to save performances because a systematic
+	 * Lua initialization cause 5% performances loss.
+	 */
+	if (!s->hlua) {
+		struct hlua *hlua;
+
+		hlua = pool_alloc(pool_head_hlua);
+		if (!hlua) {
+			SEND_ERR(s->be, "Lua filter '%s': can't initialize Lua context.\n",
+			         conf->hflt->name);
+			ret = 0;
+			goto end;
+		}
+		HLUA_INIT(hlua);
+		s->hlua = hlua;
+		if (!hlua_ctx_init(s->hlua, flt_ref_to_stack_id(conf->hflt), s->task, 0)) {
+			SEND_ERR(s->be, "Lua filter '%s': can't initialize Lua context.\n",
+			         conf->hflt->name);
+			ret = 0;
+			goto end;
+		}
+	}
+
+	flt_ctx = pool_zalloc(pool_head_hlua_flt_ctx);
+	if (!flt_ctx) {
+		SEND_ERR(s->be, "Lua filter '%s': can't initialize filter Lua context.\n",
+			 conf->hflt->name);
+		ret = 0;
+		goto end;
+	}
+	flt_ctx->hlua[0] = pool_alloc(pool_head_hlua);
+	flt_ctx->hlua[1] = pool_alloc(pool_head_hlua);
+	if (!flt_ctx->hlua[0] || !flt_ctx->hlua[1]) {
+		SEND_ERR(s->be, "Lua filter '%s': can't initialize filter Lua context.\n",
+			 conf->hflt->name);
+		ret = 0;
+		goto end;
+	}
+	HLUA_INIT(flt_ctx->hlua[0]);
+	HLUA_INIT(flt_ctx->hlua[1]);
+	if (!hlua_ctx_init(flt_ctx->hlua[0], flt_ref_to_stack_id(conf->hflt), s->task, 0) ||
+	    !hlua_ctx_init(flt_ctx->hlua[1], flt_ref_to_stack_id(conf->hflt), s->task, 0)) {
+		SEND_ERR(s->be, "Lua filter '%s': can't initialize filter Lua context.\n",
+			 conf->hflt->name);
+		ret = 0;
+		goto end;
+	}
+
+	if (!HLUA_IS_RUNNING(s->hlua)) {
+		/* The following Lua calls can fail. */
+		if (!SET_SAFE_LJMP(s->hlua)) {
+			const char *error;
+
+			if (lua_type(s->hlua->T, -1) == LUA_TSTRING)
+				error = lua_tostring(s->hlua->T, -1);
+			else
+				error = "critical error";
+			SEND_ERR(s->be, "Lua filter '%s': %s.\n", conf->hflt->name, error);
+			ret = 0;
+			goto end;
+		}
+
+		/* Check stack size. */
+		if (!lua_checkstack(s->hlua->T, 1)) {
+			SEND_ERR(s->be, "Lua filter '%s': full stack.\n", conf->hflt->name);
+			ret = 0;
+			goto end;
+		}
+
+		lua_rawgeti(s->hlua->T, LUA_REGISTRYINDEX, conf->hflt->flt_ref[s->hlua->state_id]);
+		if (lua_getfield(s->hlua->T, -1, "new") != LUA_TFUNCTION) {
+			SEND_ERR(s->be, "Lua filter '%s': 'new' field is not a function.\n",
+				 conf->hflt->name);
+			RESET_SAFE_LJMP(s->hlua);
+			ret = 0;
+			goto end;
+		}
+		lua_insert(s->hlua->T, -2);
+		s->hlua->nargs = 1;
+
+		/* We must initialize the execution timeouts. */
+		s->hlua->max_time = hlua_timeout_session;
+
+		/* At this point the execution is safe. */
+		RESET_SAFE_LJMP(s->hlua);
+	}
+
+	switch (hlua_ctx_resume(s->hlua, 0)) {
+	case HLUA_E_OK:
+		/* Nothing returned or not a table, ignore the filter for current stream */
+		if (!lua_gettop(s->hlua->T) || !lua_istable(s->hlua->T, 1)) {
+			ret = 0;
+			goto end;
+		}
+
+		/* Attached the filter pointer to the ctx */
+		lua_pushstring(s->hlua->T, "__filter");
+		lua_pushlightuserdata(s->hlua->T, filter);
+		lua_settable(s->hlua->T, -3);
+
+		/* Save a ref on the filter ctx */
+		lua_pushvalue(s->hlua->T, 1);
+		flt_ctx->ref = luaL_ref(s->hlua->T, LUA_REGISTRYINDEX);
+		filter->ctx = flt_ctx;
+		break;
+	case HLUA_E_ERRMSG:
+		SEND_ERR(s->be, "Lua filter '%s' : %s.\n", conf->hflt->name, lua_tostring(s->hlua->T, -1));
+		ret = -1;
+		goto end;
+	case HLUA_E_ETMOUT:
+		SEND_ERR(s->be, "Lua filter '%s' : 'new' execution timeout.\n", conf->hflt->name);
+		ret = 0;
+		goto end;
+	case HLUA_E_NOMEM:
+		SEND_ERR(s->be, "Lua filter '%s' : out of memory error.\n", conf->hflt->name);
+		ret = 0;
+		goto end;
+	case HLUA_E_AGAIN:
+	case HLUA_E_YIELD:
+		SEND_ERR(s->be, "Lua filter '%s': yield functions like core.tcp() or core.sleep()"
+			 " are not allowed from 'new' function.\n", conf->hflt->name);
+		ret = 0;
+		goto end;
+	case HLUA_E_ERR:
+		SEND_ERR(s->be, "Lua filter '%s': 'new' returns an unknown error.\n", conf->hflt->name);
+		ret = 0;
+		goto end;
+	default:
+		ret = 0;
+		goto end;
+	}
+
+  end:
+	if (s->hlua)
+		lua_settop(s->hlua->T, 0);
+	if (ret <= 0) {
+		if (flt_ctx) {
+			hlua_ctx_destroy(flt_ctx->hlua[0]);
+			hlua_ctx_destroy(flt_ctx->hlua[1]);
+			pool_free(pool_head_hlua_flt_ctx, flt_ctx);
+		}
+	}
+	return ret;
+}
+
+static void hlua_filter_delete(struct stream *s, struct filter *filter)
+{
+	struct hlua_flt_ctx *flt_ctx = filter->ctx;
+
+	luaL_unref(s->hlua->T, LUA_REGISTRYINDEX, flt_ctx->ref);
+	hlua_ctx_destroy(flt_ctx->hlua[0]);
+	hlua_ctx_destroy(flt_ctx->hlua[1]);
+	pool_free(pool_head_hlua_flt_ctx, flt_ctx);
+	filter->ctx = NULL;
+}
+
+static int hlua_filter_parse_fct(char **args, int *cur_arg, struct proxy *px,
+				 struct flt_conf *fconf, char **err, void *private)
+{
+	struct hlua_filter *hflt = private;
+	lua_State *L;
+	struct hlua_flt_config *conf = NULL;
+	const char *flt_id = NULL;
+	int /*error, pos, flt_ref, */state_id, pos, flt_flags = 0;
+	struct flt_ops *hlua_flt_ops = NULL;
+
+	state_id = flt_ref_to_stack_id(hflt);
+	L = hlua_states[state_id];
+
+	/* Initialize the filter ops with default callbacks */
+	hlua_flt_ops = calloc(1, sizeof(*hlua_flt_ops));
+	if (!hlua_flt_ops) {
+		memprintf(err, "Lua filter '%s' : Lua out of memory error", hflt->name);
+		return -1;
+	}
+	if (!state_id)
+		hlua_flt_ops->init = hlua_filter_init;
+	else
+		hlua_flt_ops->init_per_thread = hlua_filter_init;
+
+	hlua_flt_ops->deinit          = hlua_filter_deinit;
+	hlua_flt_ops->attach          = hlua_filter_new;
+	hlua_flt_ops->detach          = hlua_filter_delete;
+
+	/* Push the filter class on the stack and resolve all callbacks */
+	lua_rawgeti(L, LUA_REGISTRYINDEX, hflt->flt_ref[state_id]);
+
+	/*
+	 * XXX: no callback supported for now
+	 */
+
+	/* Get id and flags of the filter class */
+	if (lua_getfield(L, -1, "id") == LUA_TSTRING)
+		flt_id  = lua_tostring(L, -1);
+	lua_pop(L, 1);
+	if (lua_getfield(L, -1, "flags") == LUA_TNUMBER)
+		flt_flags  = lua_tointeger(L, -1);
+	lua_pop(L, 1);
+
+	/* Create the filter config */
+	conf = calloc(1, sizeof(*conf));
+	if (!conf) {
+		memprintf(err, "Lua filter '%s' : Lua out of memory error", hflt->name);
+		goto error;
+	}
+	conf->hflt   = hflt;
+
+	/* duplicate args */
+	for (pos = 0; *args[*cur_arg + 1 + pos]; pos++);
+	conf->args = calloc(pos + 1, sizeof(*conf->args));
+	for (pos = 0; *args[*cur_arg + 1 + pos]; pos++)
+		conf->args[pos] = strdup(args[*cur_arg + 1 + pos]);
+	conf->args[pos] = NULL;
+	*cur_arg += pos + 1;
+
+	fconf->id    = strdup(flt_id);
+	fconf->flags = flt_flags;
+	fconf->conf  = conf;
+	fconf->ops   = hlua_flt_ops;
+
+	lua_settop(L, 0);
+	return 0;
+
+  error:
+	free(hlua_flt_ops);
+	free(conf);
+	lua_settop(L, 0);
+	return -1;
+}
+
+/* This function is an LUA binding used for registering a filter. It expects a
+ * fileter name used in the haproxy configuration file and a LUA function to
+ * parse configuration arguments.
+ */
+__LJMP static int hlua_register_filter(lua_State *L)
+{
+	struct buffer *trash;
+	struct flt_kw_list *fkl;
+	struct flt_kw *fkw;
+	const char *name;
+	struct hlua_filter *hflt= NULL;
+	int flt_ref, fun_ref;
+	int len;
+
+	MAY_LJMP(check_args(L, 3, "register_filter"));
+
+	/* First argument : filter name. */
+	name = MAY_LJMP(luaL_checkstring(L, 1));
+
+	/* Second argument : The filter class */
+	flt_ref = MAY_LJMP(hlua_checktable(L, 2));
+
+	/* Third argument : lua function. */
+	fun_ref = MAY_LJMP(hlua_checkfunction(L, 3));
+
+	trash = get_trash_chunk();
+	chunk_printf(trash, "lua.%s", name);
+	fkw = flt_find_kw(trash->area);
+	if (fkw != NULL) {
+		hflt = fkw->private;
+		if (hflt->flt_ref[hlua_state_id] != -1 ||  hflt->fun_ref[hlua_state_id] != -1) {
+			ha_warning("Trying to register filter 'lua.%s' more than once. "
+				   "This will become a hard error in version 2.5.\n", name);
+		}
+		hflt->flt_ref[hlua_state_id] = flt_ref;
+		hflt->fun_ref[hlua_state_id] = fun_ref;
+		return 0;
+	}
+
+	fkl = calloc(1, sizeof(*fkl) + sizeof(struct flt_kw) * 2);
+	if (!fkl)
+		goto alloc_error;
+	fkl->scope = "HLUA";
+
+	hflt = new_hlua_filter();
+	if (!hflt)
+		goto alloc_error;
+
+	/* Fill filter */
+	hflt->name = strdup(name);
+	if (!hflt->name)
+		goto alloc_error;
+	hflt->flt_ref[hlua_state_id] = flt_ref;
+	hflt->fun_ref[hlua_state_id] = fun_ref;
+
+	/* The filter keyword */
+	len = strlen("lua.") + strlen(name) + 1;
+	fkl->kw[0].kw = calloc(1, len);
+	if (!fkl->kw[0].kw)
+		goto alloc_error;
+
+	snprintf((char *)fkl->kw[0].kw, len, "lua.%s", name);
+
+	fkl->kw[0].parse = hlua_filter_parse_fct;
+	fkl->kw[0].private = hflt;
+	memset(&fkl->kw[1], 0, sizeof(*fkl->kw));
+
+	/* Register this new filter */
+	flt_register_keywords(fkl);
+
+	return 0;
+
+  alloc_error:
+	release_hlua_filter(hflt);
+	ha_free(&fkl);
+	WILL_LJMP(luaL_error(L, "Lua out of memory error."));
+	return 0; /* Never reached */
+}
+
 static int hlua_read_timeout(char **args, int section_type, struct proxy *curpx,
                              const struct proxy *defpx, const char *file, int line,
                              char **err, unsigned int *timeout)
@@ -8683,6 +9162,7 @@ int hlua_post_init()
 	int errors;
 	char *err = NULL;
 	struct hlua_function *fcn;
+	struct hlua_filter *flt;
 
 #if USE_OPENSSL
 	/* Initialize SSL server. */
@@ -8769,6 +9249,31 @@ int hlua_post_init()
 			errors++;
 		}
 	}
+
+	/* Do the same with registered filters */
+	list_for_each_entry(flt, &referenced_filters, l) {
+		ret = 0;
+		for (i = 1; i < global.nbthread + 1; i++) {
+			if (flt->flt_ref[i] == -1)
+				ret--;
+			else
+				ret++;
+		}
+		if (abs(ret) != global.nbthread) {
+			ha_alert("Lua filter '%s' is not referenced in all thread. "
+			         "Expect function in all thread or in none thread.\n", flt->name);
+			errors++;
+			continue;
+		}
+
+		if ((flt->flt_ref[0] == -1) == (ret < 0)) {
+			ha_alert("Lua filter '%s' is referenced both ins shared Lua context (through lua-load) "
+			         "and per-thread Lua context (through lua-load-per-thread). these two context "
+			         "exclusive.\n", fcn->name);
+			errors++;
+		}
+	}
+
 
 	if (errors > 0)
 		return 0;
@@ -8906,6 +9411,7 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "register_action", hlua_register_action);
 	hlua_class_function(L, "register_service", hlua_register_service);
 	hlua_class_function(L, "register_cli", hlua_register_cli);
+	hlua_class_function(L, "register_filter", hlua_register_filter);
 	hlua_class_function(L, "yield", hlua_yield);
 	hlua_class_function(L, "set_nice", hlua_set_nice);
 	hlua_class_function(L, "sleep", hlua_sleep);
@@ -8947,6 +9453,24 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "wake_time", hlua_set_wake_time);
 
 	lua_setglobal(L, "act");
+
+	/*
+	 *
+	 * Create "Filter" object.
+	 *
+	 */
+
+	/* This table entry is the object "filter" base. */
+	lua_newtable(L);
+
+	/* push flags and constants */
+	hlua_class_const_int(L, "CONTINUE", 1);
+	hlua_class_const_int(L, "WAIT",     0);
+	hlua_class_const_int(L, "ERROR",    -1);
+
+	hlua_class_const_int(L, "FLT_CFG_FL_HTX", FLT_CFG_FL_HTX);
+
+	lua_setglobal(L, "filter");
 
 	/*
 	 *
